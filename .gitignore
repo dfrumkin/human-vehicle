@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Tool caches
+.ruff_cache/
+.pytest_cache/
+
+# Notebooks
+.ipynb_checkpoints/
+notebooks/outputs/
+
+# macOS
+.DS_Store
+
+# Agent instructions and working files
+AGENTS.md
+CLAUDE.md
+.claude/
+.codex/
+plans/
+
+# Local input data
+Videos/
+
+# Model weights, downloaded on first use
+*.pt
+*.onnx
+
+# Secrets
+.env

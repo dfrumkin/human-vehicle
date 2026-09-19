@@ -1,0 +1,88 @@
+[project]
+name = "human-vehicle"
+version = "0.1.0"
+description = "Interview homework: analyzing humans and vehicles in video."
+requires-python = ">=3.13,<3.14"
+classifiers = ["Private :: Do Not Upload"]
+dependencies = [
+    # Written against the interactions.create API, which replaced generate_content; the lower bound
+    # records which API shape the Gemini notebook assumes.
+    "google-genai>=2.23",
+    # Ultralytics' tracker matching imports lap and pip-installs it at runtime when missing, which
+    # would escape the lockfile; declaring it keeps the environment reproducible.
+    "lap>=0.5.12",
+    # The local runtime on Apple Silicon, where MLX is the only accelerated option. Everywhere else
+    # the local backend runs on transformers + torch, so this is markered rather than unconditional.
+    "accelerate>=1.0; sys_platform != 'darwin' or platform_machine != 'arm64'",
+    "matplotlib>=3.10",
+    "mlx-vlm>=0.7; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "numpy>=2.2",
+    # A named ReID encoder is an ONNX model, and Ultralytics' AutoBackend pip-installs both of these
+    # at runtime when they are missing. Same reasoning as lap above: declaring them keeps the
+    # environment reproducible.
+    "onnx>=1.22.0",
+    "onnxruntime>=1.30.0",
+    "opencv-python>=4.12",
+    "pillow>=11.1",
+    # Transitive through google-genai, declared because the Gemini notebook imports it directly to
+    # define the response schema.
+    "pydantic>=2.12.5",
+    "python-dotenv>=1.0",
+    # Both local branches need these, so neither is markered. transformers reaches Apple Silicon
+    # transitively through mlx-vlm, but only at >=5.14.0, and the MLX path is not exempt from
+    # needing qwen3_5 -- the tokenizer and video processor are transformers code either way. torch
+    # arrives through ultralytics today, and is declared because the local backend imports it
+    # directly rather than by luck. Both floors are the versions the adapters were verified against.
+    "torch>=2.14",
+    "transformers>=5.17",
+    # Floor is the version the tracker/ReID handling in human_vehicle.tracking was verified
+    # against: TrackTrack, the yolo26 assets, and the with_reid/model tracker YAML keys.
+    "ultralytics>=8.4.154",
+]
+
+[dependency-groups]
+dev = [
+    "jupyterlab>=4.4",
+    "pre-commit>=4.2",
+    "pyright>=1.1.414",
+    "pytest>=8.4",
+    # Pinned to match the rev of the ruff hook in .pre-commit-config.yaml.
+    "ruff==0.16.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/human_vehicle"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "N", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Notebooks import where the narrative needs it, and bare expressions are how you display things.
+"notebooks/*.ipynb" = ["E402", "B018"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.13"
+typeCheckingMode = "strict"
+
+# Untyped third-party libraries (mlx_vlm, the partial cv2 stubs) are the only source of Unknown
+# types in strict-checked first-party code, so switching off the reportUnknown* family silences
+# exactly that noise and nothing else.
+reportMissingTypeStubs = false
+reportMissingModuleSource = false
+reportUnknownArgumentType = false
+reportUnknownLambdaType = false
+reportUnknownMemberType = false
+reportUnknownParameterType = false
+reportUnknownVariableType = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
