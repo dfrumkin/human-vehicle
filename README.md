@@ -38,7 +38,7 @@ uv run pyright --warnings      # type check; warnings fail too
 
 ## Detection and tracking
 
-`track_video` runs a YOLO detector with the BoT-SORT tracker over a clip and returns per-frame
+`track_video` runs a YOLO detector with the TrackTrack tracker over a clip and returns per-frame
 boxes and track ids. `relabel_tracks` renumbers those ids into the two classes the labels use.
 `render_tracked_video` draws the boxes onto the original frames and writes a new mp4 — same
 resolution, same frame rate, CRF 15 — so a vision-language model can read the scene and the tracking
@@ -80,12 +80,6 @@ detection confidence to its label — `P29 0.531` instead of `P29`.
 render_tracked_video(relabelled, "annotated.mp4", show_confidence=True)
 ```
 
-It answers questions the video otherwise cannot: whether a detection cleared TrackTrack's
-`track_high_thresh` and so carried a ReID embedding at all, or `new_track_thresh` and so could have
-started its own track. Those two gates are the difference between quite different tracking bugs, and
-the number is printed to three decimals because two would round across both of them — `0.596` as
-`0.60` reads as clearing a gate it actually missed.
-
 **It is off by default and should stay off for any clip a model will read.** A label goes from two
 characters to eight, which is straight out of the pixel budget the overlay exists to respect, and
 wider labels collide more often, so more of them end up detached from their box on busy frames.
@@ -120,7 +114,6 @@ The detector, the tracker and the ReID model are plain strings:
 tracks = track_video(
     "Videos/iMGR_0AG3a8_2_3.mp4",
     weights="yolo26x.pt",
-    tracker="tracktrack.yaml",
     reid="auto",
 )
 ```
@@ -128,15 +121,9 @@ tracks = track_video(
 | Parameter | Default | Values |
 | --- | --- | --- |
 | `weights` | `"yolo26s.pt"` | `yolo26n.pt` … `yolo26x.pt`, smallest and fastest to largest and most accurate |
-| `tracker` | `"botsort.yaml"` | any tracker the installed Ultralytics ships, or a path to your own YAML |
+| `tracker` | `"tracktrack.yaml"` | any tracker the installed Ultralytics ships, or a path to your own YAML |
 | `reid` | `"none"` | `"none"`, `"auto"`, or a ReID model such as `"yolo26s-reid.onnx"` |
-| `conf` | `0.1` | the detector's confidence threshold |
 | `buffer_seconds` | `3.0` | how long a lost track stays re-findable before its id is retired |
-| `track_low_thresh` | tracker's own | weakest detection an existing track will attach to |
-| `new_track_thresh` | tracker's own | confidence needed to start a new track |
-| `lost_match_thr` | tracker's own | TrackTrack only: gate for its second, looser association pass |
-| `iou_weight` | tracker's own | TrackTrack only: how much association trusts predicted position |
-| `reid_weight` | tracker's own | TrackTrack only: how much it trusts appearance |
 
 Ultralytics 8.4.154 ships `botsort`, `tracktrack`, `bytetrack`, `deepocsort`, `ocsort` and
 `fasttrack`; the installed version is what the code validates against, and a later one may add
@@ -148,19 +135,10 @@ own backbone features, so there is no second network to run; naming a model inst
 model as the encoder. ReID is what stops a track id being retired and re-issued each time something
 is briefly occluded, so it brings id counts closer to the real number of objects.
 
-**`conf` is not what decides the output — the two tracker thresholds are.** The 0.1 default is the
-one Ultralytics uses in track mode, deliberately below its 0.25 for plain prediction so the tracker
-has weak detections to associate with. But the tracker then discards anything under its own
-`track_low_thresh` regardless of `conf`, so with TrackTrack's default of 0.25, lowering `conf`
-beneath that changes nothing at all.
-
-The two thresholds do different jobs. `track_low_thresh` is the weakest detection the tracker will
-attach to a track it is already following, so it governs how long an id survives occlusion or
-motion blur. `new_track_thresh` is how confident a detection must be to start a track, so it
-governs whether weak detections can create new objects at all.
-
-Both default to the tracker's own value, because the shipped defaults differ (TrackTrack 0.25/0.7,
-BoT-SORT 0.1/0.25) and there is no single sensible fallback. The notebook leaves them there.
+**The detection thresholds are the tracker's own, and so is `conf`.** Ultralytics uses 0.1 in track
+mode, deliberately below its 0.25 for plain prediction so the tracker has weak detections to
+associate with, and each tracker's YAML carries the thresholds it was tuned with. Nothing here
+overrides any of them; change one by pointing `tracker` at your own YAML.
 
 ### Holding an id through an occlusion
 
@@ -175,23 +153,9 @@ Raising it holds ids through longer occlusions. It is not free: a lost track's p
 predicted from the last one seen, and that prediction drifts further the longer it goes uncorrected,
 so a track kept alive long enough can be rebound to the wrong object.
 
-**The last three settings are TrackTrack's alone**, and asking any other tracker for one raises
-rather than being quietly ignored, just as with ReID.
-
-`lost_match_thr` gates a second, looser association pass that tries already-lost tracks against
-detections nothing else claimed. TrackTrack ships it at 0.0, which switches the pass off entirely;
-setting it a little above `match_thresh` gives a lost track one more chance to be rebound under its
-original id rather than a new track being started in its place. `iou_weight` and `reid_weight` split
-the association cost between where a track was predicted to be and what it looked like — favouring
-appearance helps across a gap, where the predicted box is the less trustworthy of the two, and costs
-a little in the ordinary frame-to-frame case where that box is excellent.
-
 `config_slug(tracks)` renders the configuration as a filename fragment
-(`yolo26x__tracktrack__reid-auto__imgsz1280__conf0.1__buf3__low0.25__new0.7__lost0__iouw0.5__reidw0.5`),
-built from the record the run produced, so an output file cannot be labelled with a configuration
-that did not make it. It names what ran rather than what was passed, so a setting left at the
-tracker's default is in the slug as much as an overridden one — and a setting the tracker does not
-have is left out, which is why a BoT-SORT slug is the shorter of the two. The buffer appears as the
+(`yolo26x__tracktrack__reid-auto__imgsz1280__buf3`), built from the record the run produced, so an
+output file cannot be labelled with a configuration that did not make it. The buffer appears as the
 seconds asked for rather than the frames they became, so one configuration keeps one name across
 clips of different frame rates.
 

@@ -226,10 +226,8 @@ def _label_layout(
     for box in sorted(boxes, key=lambda box: (box.track_id, box.category)):
         text = label_text(box.category, box.track_id)
         if show_confidence:
-            # Three decimals, not two: the thresholds this is read against are 0.6 and 0.7, and two
-            # decimals round across both of them -- 0.596 would print as "0.60" and read as clearing
-            # a gate it actually missed. A number that misstates the one thing it is here to answer
-            # is worse than no number.
+            # Three decimals, not two: rounding a marginal detection to two hides the distinction
+            # the number is being read for.
             text = f"{text} {box.confidence:.3f}"
         (text_width, text_height), baseline = cv2.getTextSize(text, _FONT, metrics.font_scale, _TEXT_THICKNESS)
         size = (text_width + 2 * metrics.halo, text_height + baseline + 2 * metrics.halo)

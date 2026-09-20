@@ -33,15 +33,8 @@ def _tracks(frames: list[list[TrackedBox]]) -> VideoTracks:
         tracker="botsort.yaml",
         reid="none",
         imgsz=640,
-        conf=0.1,
         buffer_seconds=3.0,
         track_buffer=90,
-        track_low_thresh=0.1,
-        new_track_thresh=0.25,
-        # BoT-SORT has no such settings, so a record of a BoT-SORT run leaves them unset.
-        lost_match_thr=None,
-        iou_weight=None,
-        reid_weight=None,
     )
 
 

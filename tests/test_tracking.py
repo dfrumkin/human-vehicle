@@ -138,6 +138,9 @@ def test_track_video_asks_the_tracker_for_the_mapped_classes(
     assert _StubYOLO.last_kwargs["device"] == "mps"
     # persist carries tracker state between calls, which would leak ids from a previous clip.
     assert "persist" not in _StubYOLO.last_kwargs
+    # conf is deliberately not passed: Ultralytics applies 0.1 in track mode itself, and passing it
+    # would only restate that default. Passing one here would be a real setting arriving unrecorded.
+    assert "conf" not in _StubYOLO.last_kwargs
 
 
 def test_track_video_rejects_non_coco_weights(monkeypatch: pytest.MonkeyPatch, make_video: MakeVideo) -> None:
@@ -187,62 +190,31 @@ def test_reid_on_a_tracker_without_one_is_an_error(tracker: str) -> None:
         build_tracker_config(tracker, "auto")
 
 
-def test_thresholds_default_to_the_trackers_own() -> None:
-    """The shipped defaults differ per tracker, so None must mean "leave it alone"."""
-    assert build_tracker_config("tracktrack.yaml", "none")["track_low_thresh"] == 0.25
-    assert build_tracker_config("tracktrack.yaml", "none")["new_track_thresh"] == 0.7
-    assert build_tracker_config("botsort.yaml", "none")["track_low_thresh"] == 0.1
-    assert build_tracker_config("botsort.yaml", "none")["new_track_thresh"] == 0.25
-
-
-def test_thresholds_can_be_overridden() -> None:
-    """These decide what reaches the output: track_low_thresh what an existing track will attach
-    to, new_track_thresh what may start a new one."""
-    config = build_tracker_config("tracktrack.yaml", "auto", track_low_thresh=0.05, new_track_thresh=0.5)
-
-    assert config["track_low_thresh"] == 0.05
-    assert config["new_track_thresh"] == 0.5
-    # Overriding one must leave the other where the tracker had it.
-    assert build_tracker_config("tracktrack.yaml", "none", track_low_thresh=0.05)["new_track_thresh"] == 0.7
-
-
-def test_setting_a_threshold_a_tracker_lacks_is_an_error(tmp_path: Path) -> None:
+def test_setting_a_buffer_a_tracker_lacks_is_an_error(tmp_path: Path) -> None:
     """Same reasoning as ReID: a key the tracker never reads would be a silent no-op."""
     custom = tmp_path / "custom.yaml"
     YAML.save(str(custom), {"tracker_type": "bytetrack"})
 
-    with pytest.raises(ValueError, match="no track_low_thresh"):
-        build_tracker_config(str(custom), "none", track_low_thresh=0.05)
+    with pytest.raises(ValueError, match="no track_buffer"):
+        build_tracker_config(str(custom), "none", track_buffer=90)
 
 
-def test_tracktrack_settings_can_be_overridden() -> None:
+def test_the_buffer_can_be_overridden() -> None:
     """The buffer is a frame count here: turning a duration into one needs the clip's frame rate,
-    which `track_video` has and this does not."""
-    config = build_tracker_config(
-        "tracktrack.yaml", "auto", track_buffer=90, lost_match_thr=0.8, iou_weight=0.4, reid_weight=0.6
-    )
+    which `track_video` has and this does not. Everything else must stay where the tracker had it,
+    since the buffer is the only setting this project moves."""
+    config = build_tracker_config("tracktrack.yaml", "auto", track_buffer=90)
 
     assert config["track_buffer"] == 90
-    assert config["lost_match_thr"] == 0.8
-    assert (config["iou_weight"], config["reid_weight"]) == (0.4, 0.6)
-    # Overriding these must leave everything else where the tracker had it.
     assert (config["track_low_thresh"], config["new_track_thresh"]) == (0.25, 0.7)
-    assert config["match_thresh"] == 0.7
-
-
-def test_tracktrack_settings_default_to_the_trackers_own() -> None:
-    """0.0 for lost_match_thr is TrackTrack's way of switching its relaxed rebind pass off."""
-    config = build_tracker_config("tracktrack.yaml", "none")
-
-    assert config["track_buffer"] == 30
-    assert config["lost_match_thr"] == 0.0
     assert (config["iou_weight"], config["reid_weight"]) == (0.5, 0.5)
+    assert (config["lost_match_thr"], config["match_thresh"]) == (0.0, 0.7)
 
 
-def test_setting_a_tracktrack_only_key_on_another_tracker_is_an_error() -> None:
-    """BoT-SORT has no relaxed rebind pass, so this would configure nothing at all."""
-    with pytest.raises(ValueError, match="no lost_match_thr"):
-        build_tracker_config("botsort.yaml", "none", lost_match_thr=0.8)
+def test_the_buffer_defaults_to_the_trackers_own() -> None:
+    """None must mean "leave it alone", since the shipped defaults differ per tracker."""
+    assert build_tracker_config("tracktrack.yaml", "none")["track_buffer"] == 30
+    assert build_tracker_config("botsort.yaml", "none")["track_buffer"] == 30
 
 
 @pytest.mark.parametrize(
@@ -270,16 +242,30 @@ def test_track_buffer_follows_the_clips_frame_rate(
     assert result.buffer_seconds == 3.0
 
 
-def test_track_buffer_applies_on_the_default_path(monkeypatch: pytest.MonkeyPatch, make_video: MakeVideo) -> None:
-    """The conversion is tracker-independent. Every other buffer case here names TrackTrack, so
-    without this one an implementation that wired it into a TrackTrack-only branch would pass."""
+def test_track_buffer_applies_to_a_non_tracktrack_tracker(
+    monkeypatch: pytest.MonkeyPatch, make_video: MakeVideo
+) -> None:
+    """The conversion is tracker-independent. Every other buffer case here runs TrackTrack, which is
+    now also the default, so without this one an implementation that wired the buffer into a
+    TrackTrack-only branch would pass. BoT-SORT is named explicitly for that reason."""
     monkeypatch.setattr(tracking, "YOLO", _StubYOLO)
 
-    result = track_video(make_video(fps="30000/1001", frames=3))
+    result = track_video(make_video(fps="30000/1001", frames=3), tracker="botsort.yaml")
 
     assert result.tracker == "botsort.yaml"
     assert _StubYOLO.last_tracker_config["track_buffer"] == 90
-    assert "__buf3__" in config_slug(result)
+    assert config_slug(result).endswith("__buf3")
+
+
+def test_the_default_tracker_is_tracktrack(monkeypatch: pytest.MonkeyPatch, make_video: MakeVideo) -> None:
+    """The notebook names no tracker, so the default is what produces every output file -- and the
+    slug those files are named by. A silent change here would re-render everything."""
+    monkeypatch.setattr(tracking, "YOLO", _StubYOLO)
+
+    result = track_video(make_video(frames=3))
+
+    assert result.tracker == "tracktrack.yaml"
+    assert _StubYOLO.last_tracker_config["tracker_type"] == "tracktrack"
 
 
 def test_a_non_positive_buffer_is_an_error(monkeypatch: pytest.MonkeyPatch, make_video: MakeVideo) -> None:
@@ -290,50 +276,17 @@ def test_a_non_positive_buffer_is_an_error(monkeypatch: pytest.MonkeyPatch, make
         track_video(make_video(frames=3), buffer_seconds=0)
 
 
-def test_track_video_records_settings_the_tracker_lacks_as_none(
-    monkeypatch: pytest.MonkeyPatch, make_video: MakeVideo
-) -> None:
-    """BoT-SORT has none of TrackTrack's association settings, and the record says so rather than
-    inventing values. This is what keeps them out of a BoT-SORT slug."""
+def test_track_video_leaves_the_tracker_settings_alone(monkeypatch: pytest.MonkeyPatch, make_video: MakeVideo) -> None:
+    """The buffer is the only setting threaded through, so every other key the tracker reads must
+    arrive at its shipped value."""
     monkeypatch.setattr(tracking, "YOLO", _StubYOLO)
 
-    result = track_video(make_video(frames=3), tracker="botsort.yaml")
+    track_video(make_video(frames=3), tracker="tracktrack.yaml")
 
-    assert (result.lost_match_thr, result.iou_weight, result.reid_weight) == (None, None, None)
-    assert "lost" not in config_slug(result)
-
-
-def test_track_video_records_the_effective_tracktrack_settings(
-    monkeypatch: pytest.MonkeyPatch, make_video: MakeVideo
-) -> None:
-    """Recorded from the built config, so an overridden run and a defaulted one both say what ran."""
-    monkeypatch.setattr(tracking, "YOLO", _StubYOLO)
-
-    tuned = track_video(
-        make_video(frames=3),
-        tracker="tracktrack.yaml",
-        lost_match_thr=0.8,
-        iou_weight=0.4,
-        reid_weight=0.6,
-    )
-
-    assert (tuned.lost_match_thr, tuned.iou_weight, tuned.reid_weight) == (0.8, 0.4, 0.6)
-    assert _StubYOLO.last_tracker_config["lost_match_thr"] == 0.8
-
-    defaulted = track_video(make_video(frames=3), tracker="tracktrack.yaml")
-    assert (defaulted.lost_match_thr, defaulted.iou_weight, defaulted.reid_weight) == (0.0, 0.5, 0.5)
-
-
-def test_track_video_records_the_effective_thresholds(monkeypatch: pytest.MonkeyPatch, make_video: MakeVideo) -> None:
-    """Recorded from the built config, so a default run still says what the tracker used."""
-    monkeypatch.setattr(tracking, "YOLO", _StubYOLO)
-
-    defaulted = track_video(make_video(frames=3), tracker="tracktrack.yaml")
-    assert (defaulted.track_low_thresh, defaulted.new_track_thresh) == (0.25, 0.7)
-
-    lowered = track_video(make_video(frames=3), tracker="tracktrack.yaml", track_low_thresh=0.05)
-    assert (lowered.track_low_thresh, lowered.new_track_thresh) == (0.05, 0.7)
-    assert _StubYOLO.last_tracker_config["track_low_thresh"] == 0.05
+    config = _StubYOLO.last_tracker_config
+    assert (config["track_low_thresh"], config["new_track_thresh"]) == (0.25, 0.7)
+    assert (config["iou_weight"], config["reid_weight"]) == (0.5, 0.5)
+    assert config["lost_match_thr"] == 0.0
 
 
 def test_unsupported_tracker_type_is_rejected(tmp_path: Path) -> None:
@@ -356,38 +309,16 @@ def test_config_slug_describes_the_run(make_video: MakeVideo) -> None:
         tracker="tracktrack.yaml",
         reid="auto",
         imgsz=1280,
-        conf=0.05,
         buffer_seconds=3.0,
         track_buffer=90,
-        track_low_thresh=0.05,
-        new_track_thresh=0.7,
-        lost_match_thr=0.8,
-        iou_weight=0.4,
-        reid_weight=0.6,
     )
 
-    assert config_slug(tracks) == (
-        "yolo26x__tracktrack__reid-auto__imgsz1280__conf0.05__buf3__low0.05__new0.7__lost0.8__iouw0.4__reidw0.6"
-    )
+    assert config_slug(tracks) == "yolo26x__tracktrack__reid-auto__imgsz1280__buf3"
 
     # A ReID given as a path must not leak separators or extensions into a filename.
     slug = config_slug(replace(tracks, reid="/models/my reid.onnx"))
-    assert slug == (
-        "yolo26x__tracktrack__reid-my-reid__imgsz1280__conf0.05__buf3__low0.05__new0.7__lost0.8__iouw0.4__reidw0.6"
-    )
+    assert slug == "yolo26x__tracktrack__reid-my-reid__imgsz1280__buf3"
     assert "/" not in slug
-
-    # Settings the tracker does not have are left out rather than written as a placeholder, which is
-    # what keeps a BoT-SORT slug free of TrackTrack's.
-    bare = replace(
-        tracks,
-        track_low_thresh=None,
-        new_track_thresh=None,
-        lost_match_thr=None,
-        iou_weight=None,
-        reid_weight=None,
-    )
-    assert config_slug(bare) == "yolo26x__tracktrack__reid-auto__imgsz1280__conf0.05__buf3"
 
     # The buffer is slugged as the seconds asked for, never as the frames they became: the frame
     # count varies per clip, so slugging it would rename one configuration on every clip.
@@ -405,19 +336,12 @@ def test_track_video_records_its_configuration(monkeypatch: pytest.MonkeyPatch, 
         tracker="tracktrack.yaml",
         reid="auto",
         imgsz=1280,
-        conf=0.05,
     )
 
     assert (result.weights, result.tracker, result.reid) == ("yolo26x.pt", "tracktrack.yaml", "auto")
-    assert (result.imgsz, result.conf) == (1280, 0.05)
+    assert result.imgsz == 1280
     assert _StubYOLO.last_kwargs["imgsz"] == 1280
-    assert _StubYOLO.last_kwargs["conf"] == 0.05
-    # Nothing but the buffer was passed, so the slug carries TrackTrack's own values for the rest --
-    # including the 0.0 that means its relaxed rebind pass is switched off. A slug states what ran,
-    # not what was typed, so a defaulted setting is named just as an overridden one is.
-    assert config_slug(result) == (
-        "yolo26x__tracktrack__reid-auto__imgsz1280__conf0.05__buf3__low0.25__new0.7__lost0__iouw0.5__reidw0.5"
-    )
+    assert config_slug(result) == "yolo26x__tracktrack__reid-auto__imgsz1280__buf3"
 
 
 def test_track_video_hands_the_tracker_a_live_config(monkeypatch: pytest.MonkeyPatch, make_video: MakeVideo) -> None:

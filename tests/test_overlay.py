@@ -120,15 +120,8 @@ def _tracks(source: Path, *, width: int = 64, height: int = 48, frames: int = 5)
         tracker="botsort.yaml",
         reid="none",
         imgsz=640,
-        conf=0.1,
         buffer_seconds=3.0,
         track_buffer=90,
-        track_low_thresh=0.1,
-        new_track_thresh=0.25,
-        # BoT-SORT has no such settings, so a record of a BoT-SORT run leaves them unset.
-        lost_match_thr=None,
-        iou_weight=None,
-        reid_weight=None,
     )
 
 
@@ -496,10 +489,8 @@ def test_a_label_names_the_category_not_the_class() -> None:
 def test_confidence_is_drawn_only_when_asked_for() -> None:
     """The debugging view, and the precision it has to have.
 
-    Three decimals is not cosmetic. This overlay gets read against TrackTrack's 0.6 and 0.7 gates,
-    and at two decimals 0.596 prints as "0.60" -- a detection that missed `track_high_thresh` and
-    carried no ReID embedding would look like one that cleared it. The 0.596 here fails that way if
-    the format is ever shortened.
+    Three decimals is not cosmetic: at two, 0.596 prints as "0.60" and a marginal detection reads
+    as a comfortable one. The 0.596 here fails that way if the format is ever shortened.
     """
     width, height = 1920, 1080
     box = replace(_tracked(7, 400, 300, 700, 600, "person"), confidence=0.596)

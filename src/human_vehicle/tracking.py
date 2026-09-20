@@ -71,11 +71,9 @@ class VideoTracks:
     `fps` is the exact rational ffprobe reports, e.g. "30000/1001".
 
     The trailing fields record the configuration that produced this record, so an output file can
-    be named after the run rather than after what the caller believes it configured. The tracker
-    settings are the values the tracker actually used, whether they were overridden or left at its
-    defaults, and are None where the tracker has no such setting at all. `reid` is the string that
-    was requested; for every `yolo26*` detector that is also what ran, but Ultralytics can resolve
-    "auto" to a separate encoder for an end2end detector without that showing here.
+    be named after the run rather than after what the caller believes it configured. `reid` is the
+    string that was requested; for every `yolo26*` detector that is also what ran, but Ultralytics
+    can resolve "auto" to a separate encoder for an end2end detector without that showing here.
 
     `buffer_seconds` is what was asked for and `track_buffer` the frame count it became for this
     clip's frame rate. Both are kept: the seconds are what identifies a configuration across clips,
@@ -92,46 +90,25 @@ class VideoTracks:
     tracker: str
     reid: str
     imgsz: int
-    conf: float
     buffer_seconds: float
     track_buffer: int
-    track_low_thresh: float | None
-    new_track_thresh: float | None
-    lost_match_thr: float | None
-    iou_weight: float | None
-    reid_weight: float | None
 
 
-def build_tracker_config(
-    tracker: str,
-    reid: str,
-    *,
-    track_buffer: int | None = None,
-    track_low_thresh: float | None = None,
-    new_track_thresh: float | None = None,
-    lost_match_thr: float | None = None,
-    iou_weight: float | None = None,
-    reid_weight: float | None = None,
-) -> dict[str, Any]:
+def build_tracker_config(tracker: str, reid: str, *, track_buffer: int | None = None) -> dict[str, Any]:
     """Return the tracker configuration to run, with the requested overrides applied.
 
     `tracker` names a tracker Ultralytics ships ("botsort.yaml", "tracktrack.yaml", ...) or points
     at a custom YAML. `reid` is "none" for no ReID stage, "auto" to reuse the detector's own
     backbone features, or the name or path of a ReID model.
 
-    Every override is left at the tracker's own default when None, because the defaults differ per
-    tracker and there is no single value to fall back to. Setting one the tracker does not have
-    raises, since it would otherwise be a silent no-op.
+    `track_buffer` is left at the tracker's own default when None. Setting it on a tracker that does
+    not have it raises, since it would otherwise be a silent no-op. It is a frame count, which is
+    what the tracker wants — deriving it from a duration needs the clip's frame rate, and that
+    belongs to `track_video`, not here.
 
-    `track_buffer` is a frame count, which is what the tracker wants — deriving it from a duration
-    needs the clip's frame rate, and that belongs to `track_video`, not here.
-
-    `lost_match_thr`, `iou_weight` and `reid_weight` exist only on TrackTrack. Values are passed
-    through as given: the weights need not sum to anything in particular, and no range is enforced.
-
-    None of this can be passed to `model.track()` as an argument: Ultralytics reads it out of the
-    tracker YAML. So the settings are applied to a copy of that config here, and `track_video`
-    writes the result to a file for Ultralytics to read back.
+    Neither of these can be passed to `model.track()` as an argument: Ultralytics reads them out of
+    the tracker YAML. So they are applied to a copy of that config here, and `track_video` writes
+    the result to a file for Ultralytics to read back.
     """
     # str(): check_yaml is typed as returning a list for list input, which this call cannot pass.
     config: dict[str, Any] = YAML.load(str(check_yaml(tracker)))
@@ -142,20 +119,10 @@ def build_tracker_config(
             f"{tracker} declares tracker_type={tracker_type!r}; Ultralytics supports {sorted(TRACKER_MAP)}"
         )
 
-    overrides: tuple[tuple[str, int | float | None], ...] = (
-        ("track_buffer", track_buffer),
-        ("track_low_thresh", track_low_thresh),
-        ("new_track_thresh", new_track_thresh),
-        ("lost_match_thr", lost_match_thr),
-        ("iou_weight", iou_weight),
-        ("reid_weight", reid_weight),
-    )
-    for key, value in overrides:
-        if value is None:
-            continue
-        if key not in config:
-            raise ValueError(f"{tracker} ({tracker_type}) has no {key}, so setting it would be silently ignored")
-        config[key] = value
+    if track_buffer is not None:
+        if "track_buffer" not in config:
+            raise ValueError(f"{tracker} ({tracker_type}) has no track_buffer, so setting it would be silently ignored")
+        config["track_buffer"] = track_buffer
 
     # Whether a tracker has a ReID stage is read from its own config rather than from a list kept
     # here, so a future Ultralytics that adds one needs no change.
@@ -195,35 +162,17 @@ def _slug_part(value: str) -> str:
 def config_slug(tracks: VideoTracks) -> str:
     """A filename fragment naming the configuration that produced `tracks`.
 
-    For example
-    "yolo26x__tracktrack__reid-auto__imgsz1280__conf0.1__buf3__low0.25__new0.7__lost0.8__iouw0.4__reidw0.6".
-
-    Every tracker setting is included because they are what decide the output, so two runs that
-    differ only in one of them must not land on the same filename. A setting the tracker does not
-    have is left out rather than written as a placeholder, which is why a BoT-SORT slug is shorter
-    than a TrackTrack one.
+    For example "yolo26x__tracktrack__reid-auto__imgsz1280__buf3".
 
     The buffer appears as the seconds that were asked for, not the frame count they became. The
     frame count depends on the clip, so slugging it would give one configuration a different name on
     every clip, and could give two different configurations the same name on a clip where the floor
     flattens both.
     """
-    slug = (
+    return (
         f"{_slug_part(tracks.weights)}__{_slug_part(tracks.tracker)}"
-        f"__reid-{_slug_part(tracks.reid)}__imgsz{tracks.imgsz}__conf{tracks.conf:g}"
-        f"__buf{tracks.buffer_seconds:g}"
+        f"__reid-{_slug_part(tracks.reid)}__imgsz{tracks.imgsz}__buf{tracks.buffer_seconds:g}"
     )
-    optional = (
-        ("low", tracks.track_low_thresh),
-        ("new", tracks.new_track_thresh),
-        ("lost", tracks.lost_match_thr),
-        ("iouw", tracks.iou_weight),
-        ("reidw", tracks.reid_weight),
-    )
-    for name, value in optional:
-        if value is not None:
-            slug += f"__{name}{value:g}"
-    return slug
 
 
 # No fewer frames than this, however few seconds they span. At 6 fps a three-second window is 18
@@ -345,16 +294,10 @@ def track_video(
     source: str | Path,
     *,
     weights: str = "yolo26s.pt",
-    tracker: str = "botsort.yaml",
+    tracker: str = "tracktrack.yaml",
     reid: str = "none",
     imgsz: int = 640,
-    conf: float = 0.1,
     buffer_seconds: float = 3.0,
-    track_low_thresh: float | None = None,
-    new_track_thresh: float | None = None,
-    lost_match_thr: float | None = None,
-    iou_weight: float | None = None,
-    reid_weight: float | None = None,
     device: str = "mps",
 ) -> VideoTracks:
     """Detect and track people and vehicles through a clip.
@@ -363,8 +306,9 @@ def track_video(
 
     - `weights`: any Ultralytics detector, e.g. "yolo26n.pt" through "yolo26x.pt". Downloads on
       first use.
-    - `tracker`: a tracker Ultralytics ships ("botsort.yaml", "tracktrack.yaml", "bytetrack.yaml",
-      "deepocsort.yaml", "ocsort.yaml", "fasttrack.yaml") or a path to your own YAML.
+    - `tracker`: TrackTrack by default, or any other tracker Ultralytics ships ("botsort.yaml",
+      "bytetrack.yaml", "deepocsort.yaml", "ocsort.yaml", "fasttrack.yaml"), or a path to your own
+      YAML.
     - `reid`: "none" for no ReID stage, "auto" to reuse the detector's own backbone features, or a
       model such as "yolo26s-reid.onnx". Only BoT-SORT, TrackTrack and Deep OC-SORT have a ReID
       stage; asking the others for one raises rather than being ignored.
@@ -373,38 +317,16 @@ def track_video(
     CPU on macOS unless MPS is asked for by name. `imgsz` is worth raising to 960 or 1280 on 4K
     footage, where 640 misses small, distant people.
 
-    `conf` is the detector's threshold, defaulting to the 0.1 Ultralytics itself uses in track mode
-    (deliberately lower than its 0.25 for plain prediction, so the tracker's low-score association
-    stage has weak detections to work with). It is usually *not* what decides the output, though:
-    the two tracker thresholds below are, and a detection under `track_low_thresh` is discarded
-    whatever `conf` let through.
+    `buffer_seconds` is how long a lost track stays re-findable before its id is retired, which is
+    what decides whether an id survives an occlusion. It is given in seconds because that is what
+    an occlusion is measured in; the tracker's own `track_buffer` is a frame count it never scales
+    by the frame rate, so a fixed one means a five-fold different window across clips shot at 6 fps
+    and 30 fps. The derived frame count is floored at `MIN_TRACK_BUFFER`.
 
-    - `track_low_thresh`: the weakest detection the tracker will attach to a track it is already
-      following. Lowering it buys continuity through occlusion and motion blur — objects keep their
-      id instead of being dropped and re-acquired — at the risk of a track coasting on a bad box.
-    - `new_track_thresh`: how confident a detection must be to *start* a track. This is the one
-      that governs whether weak detections can create new objects, so lowering `track_low_thresh`
-      alone extends existing tracks without inventing new ones.
-
-    Both default to None, meaning the tracker's own value: the shipped defaults differ per tracker
-    (TrackTrack 0.25/0.7, BoT-SORT 0.1/0.25), so there is no single sensible fallback.
-
-    `buffer_seconds` is how long a lost track stays re-findable before its id is retired, and is
-    the other half of how long an id survives an occlusion. It is given in seconds because that is
-    what an occlusion is measured in; the tracker's own `track_buffer` is a frame count it never
-    scales by the frame rate, so a fixed one means a five-fold different window across clips
-    shot at 6 fps and 30 fps. The derived frame count is floored at `MIN_TRACK_BUFFER`.
-
-    The last three are TrackTrack's, and asking any other tracker for them raises:
-
-    - `lost_match_thr`: gate for a second, looser association pass that tries already-lost tracks
-      against detections nothing else claimed. TrackTrack ships 0.0, which switches the pass off
-      entirely. Setting it a little above `match_thresh` gives a lost track a second chance to be
-      rebound under its original id instead of a new track being started.
-    - `iou_weight` and `reid_weight`: how the association cost is split between where a track was
-      predicted to be and what it looked like. Favouring appearance helps across a gap, where the
-      predicted box has been coasting and is the less trustworthy of the two, and costs a little
-      accuracy in the ordinary frame-to-frame case where the box is excellent.
+    Everything else the tracker reads is left at the value its own YAML ships, including the
+    detection thresholds. The detector's `conf` is likewise Ultralytics' own: it uses 0.1 in track
+    mode, deliberately below its 0.25 for plain prediction, so the low-score association stage has
+    weak detections to work with.
     """
     source_path = Path(source)
     if not source_path.is_file():
@@ -414,16 +336,7 @@ def track_video(
     width, height, fps = _probe(source_path)
     track_buffer = _track_buffer_frames(buffer_seconds, fps)
 
-    tracker_config = build_tracker_config(
-        tracker,
-        reid,
-        track_buffer=track_buffer,
-        track_low_thresh=track_low_thresh,
-        new_track_thresh=new_track_thresh,
-        lost_match_thr=lost_match_thr,
-        iou_weight=iou_weight,
-        reid_weight=reid_weight,
-    )
+    tracker_config = build_tracker_config(tracker, reid, track_buffer=track_buffer)
 
     model = YOLO(weights)
     _check_class_names(model.names)
@@ -434,7 +347,7 @@ def track_video(
     with tempfile.TemporaryDirectory() as directory:
         tracker_path = Path(directory) / "tracker.yaml"
         YAML.save(str(tracker_path), tracker_config)
-        frames = _tracked_frames(model, source_path, tracker_path, imgsz=imgsz, conf=conf, device=device)
+        frames = _tracked_frames(model, source_path, tracker_path, imgsz=imgsz, device=device)
 
     return VideoTracks(
         source=source_path,
@@ -446,31 +359,25 @@ def track_video(
         tracker=tracker,
         reid=reid,
         imgsz=imgsz,
-        conf=conf,
         buffer_seconds=buffer_seconds,
         track_buffer=track_buffer,
-        # The effective values, not the arguments: a record should say what the tracker used. A
-        # tracker without one of these settings records None, which keeps it out of the slug.
-        track_low_thresh=tracker_config.get("track_low_thresh"),
-        new_track_thresh=tracker_config.get("new_track_thresh"),
-        lost_match_thr=tracker_config.get("lost_match_thr"),
-        iou_weight=tracker_config.get("iou_weight"),
-        reid_weight=tracker_config.get("reid_weight"),
     )
 
 
 def _tracked_frames(
-    model: YOLO, source: Path, tracker_path: Path, *, imgsz: int, conf: float, device: str
+    model: YOLO, source: Path, tracker_path: Path, *, imgsz: int, device: str
 ) -> tuple[FrameTracks, ...]:
     """Run the tracker over the clip and convert every result, one decoded frame at a time."""
     # stream=True keeps one decoded frame alive at a time; the non-streaming call would retain
     # every frame of the clip, which is around 15 GB for a 4K minute.
+    #
+    # No conf: Ultralytics applies 0.1 in track mode itself, so passing it would only restate the
+    # default.
     results = model.track(
         str(source),
         tracker=str(tracker_path),
         stream=True,
         imgsz=imgsz,
-        conf=conf,
         device=device,
         classes=sorted(COCO_CLASSES),
         save=False,
