@@ -1,10 +1,11 @@
-"""The vision-language model behind `human_vehicle.interactions`, and the seam it sits behind.
+"""The vision-language model this project asks its questions of, and the seam it sits behind.
 
-`interactions` owns the question -- the prompt, the schema, the validation, the windowing -- and
-knows a backend only through `VlmBackend`. This module owns the model: its knobs, and whatever that
-particular model needs in order to answer in that schema. A backend whose runtime cannot constrain
-output has to put the shape into the prompt itself, which is why some prompt text is written here.
-Another model means another class here satisfying the protocol.
+The question -- the prompt, the schema, the validation, the windowing -- belongs to the caller, and
+a caller reaches a model only through `VlmBackend`. This module owns the model: its knobs, and
+whatever that particular model needs in order to answer in the schema it is handed. A backend whose
+runtime cannot constrain output has to put the shape into the prompt itself, which is why the schema
+description and the JSON repair live here. Another model means another class here satisfying the
+protocol.
 
 There are two implementations. `GeminiBackend` is written against the `interactions.create` API and
 records the installed `google-genai` version in its `config`. `QwenBackend` runs Qwen3.5 locally,
@@ -53,9 +54,8 @@ class VlmResponse:
 class VlmBackend(Protocol):
     """A vision-language model that can be shown a clip, or a segment of one, and asked a question.
 
-    `interactions.find_interactions` drives one of these. The protocol is deliberately small: the
-    prompt and the schema are handed in, so a second implementation supplies a model and nothing
-    else.
+    The protocol is deliberately small: the prompt and the schema are handed in, so a second
+    implementation supplies a model and nothing else.
     """
 
     @property
@@ -77,11 +77,10 @@ class VlmBackend(Protocol):
         """Whether a window's prompt should be written on the segment's own clock.
 
         False -- the usual case -- means the model is told it is seeing part of a longer clip and
-        asked for times on that clip's clock, which is what `interactions.build_prompt` does with a
-        window.
+        asked for times on that clip's clock, which is what a window's prompt normally says.
 
-        True means the opposite: `find_interactions` should describe the window as if it were a clip
-        in its own right, because this backend shows the model exactly that. **It does not change
+        True means the opposite: the caller should describe the window as if it were a clip in its
+        own right, because this backend shows the model exactly that. **It does not change
         what `generate` returns.** Such a backend corrects the times itself and still hands back
         clip-global ones, so validation is unaffected and needs no matching branch. Reading this as
         "reports segment-local times" and adding one would double-shift every window.
@@ -102,8 +101,8 @@ class VlmBackend(Protocol):
         """Answer `prompt` about `video`, or about `window` of it, as JSON.
 
         `schema` is the shape the answer must take, and `text` must come back as JSON and nothing
-        else -- `interactions.parse_response` hands it straight to `json.loads`, with no fence
-        stripping and no brace matching.
+        else -- the caller hands it straight to `json.loads`, with no fence stripping and no brace
+        matching.
 
         A backend whose runtime can constrain output to `schema` gets that for free. One that cannot
         -- an unconstrained local model will happily wrap its answer in prose or a ```json fence --
@@ -113,7 +112,7 @@ class VlmBackend(Protocol):
         the shared parser would also let a constrained backend's regression pass unnoticed.
 
         Times in the answer are expected on the **clip's** clock even when `window` is set -- the
-        prompt says so, and `interactions` validates against it.
+        prompt says so, and the caller validates against it.
         """
         ...
 
@@ -164,7 +163,7 @@ class GeminiBackend:
         max_output_tokens: int = 8192,
         client: Any = None,
     ) -> None:
-        """The sampling knobs are Gemini's own; `interactions` never sees them.
+        """The sampling knobs are Gemini's own: set here, never part of the question being asked.
 
         `fps` defaults to 2.0 rather than the documented 1.0: a 9-second clip sampled nine times can
         miss a two-second interaction between frames. `resolution="low"` is 70 tokens a frame and is
@@ -231,8 +230,8 @@ class GeminiBackend:
         """Upload `video` once per backend and reuse the handle.
 
         Polling is bounded and checks for failure. Waiting only for ACTIVE hangs forever on an
-        upload that will never reach it, which in a notebook looks like a cell that simply never
-        returns -- the one failure mode there is hardest to notice.
+        upload that will never reach it, which looks like a call that simply never returns -- the
+        one failure mode hardest to notice.
         """
         key = str(video)
         if key in self._uploads:
@@ -358,7 +357,7 @@ PIXELS_PER_FRAME = 640 * 480
 # tight enough that a keyframe-rounded cut cannot pass.
 TRIM_TOLERANCE_S = 0.2
 
-# How `interactions.Interaction` names a time, and so how `time_fields` finds one in the schema.
+# How the schema being answered names a time, and so how `time_fields` finds one in it.
 TIME_SUFFIX = "_time_s"
 
 _FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.IGNORECASE)
@@ -412,8 +411,8 @@ def repair_json(text: str) -> tuple[str, Any | None]:
 
     Three steps, stopping at the first that yields JSON: the text as it stands, then with a
     Markdown fence stripped, then the span from the first brace to the last. Where none parse the
-    original text comes back with None, so `interactions.parse_response` raises on it and the call
-    is recorded with the model's own words rather than something tidied.
+    original text comes back with None, so the caller's parser raises on it and the call is
+    recorded with the model's own words rather than something tidied.
 
     The brace slice is a last resort with a known limit: prose *containing* braces before the answer
     spans both and fails. That is left to fail loudly rather than fixed with a scanner -- with
@@ -479,7 +478,7 @@ def describe_schema(schema: Mapping[str, Any]) -> str:
     response error. An example of the answer is unambiguous where a description of the answer is
     not, and it costs a fifth of the tokens.
 
-    Derived from the schema rather than written out, so it cannot drift from what `interactions`
+    Derived from the schema rather than written out, so it cannot drift from what the caller
     actually validates. Falls back to the raw schema for a shape this does not recognise, which is
     worse but never wrong.
     """
@@ -514,9 +513,9 @@ def describe_schema(schema: Mapping[str, Any]) -> str:
 def time_fields(schema: Mapping[str, Any]) -> tuple[str, tuple[str, ...]]:
     """Where the times are in an answer of this shape: the list's key, and the fields to move.
 
-    Read out of the schema rather than written down, so this cannot drift from what `interactions`
-    asks for and validates. Times are the numeric fields named `*_time_s`, which is the convention
-    `interactions.Interaction` follows; `confidence` is numeric too, and must not be shifted.
+    Read out of the schema rather than written down, so this cannot drift from what the caller asks
+    for and validates. Times are the numeric fields named `*_time_s`, which is the convention the
+    schema follows; `confidence` is numeric too, and must not be shifted.
 
     Raises where the schema has no such shape or no times in it, because the alternative -- shifting
     nothing and saying nothing -- is a windowed run whose times are all wrong and whose record looks
@@ -536,10 +535,10 @@ def time_fields(schema: Mapping[str, Any]) -> tuple[str, tuple[str, ...]]:
 def shift_times(payload: Any, offset: float, *, key: str, fields: Sequence[str]) -> Any:
     """Return `payload` with every interaction's times moved onto the clip's clock.
 
-    **This never raises, whatever shape it is handed.** `find_interactions` records `raw_text` and
-    `usage` only after `generate` returns, and `parse_response` is what turns a malformed answer
-    into a recorded response error or per-item `malformed` entries. Raising here would turn the
-    model's bad output into a *backend* failure and lose the text and usage that were paid for, so
+    **This never raises, whatever shape it is handed.** A caller records `raw_text` and `usage`
+    only after `generate` returns, and its parser is what turns a malformed answer into a recorded
+    response error or per-item `malformed` entries. Raising here would turn the model's bad output
+    into a *backend* failure and lose the text and usage that were paid for, so
     anything unexpected -- no interactions key, a non-list, items that are not objects, a time that
     is not a number -- passes through untouched for the validator to judge.
 
@@ -629,9 +628,9 @@ class MlxRuntime:
     """Qwen3.5 through mlx-vlm, on Apple Silicon.
 
     `entry_points` exists for tests: left None the library is imported on first use, so importing
-    this module -- which `interactions` does unconditionally -- never needs mlx-vlm present. Handed
-    a stand-in, the adapter's own behaviour can be exercised on a machine that has never installed
-    it, which is the only way the other platform's adapter gets covered at all.
+    this module never needs mlx-vlm present. Handed a stand-in, the adapter's own behaviour can be
+    exercised on a machine that has never installed it, which is the only way the other platform's
+    adapter gets covered at all.
     """
 
     name = "mlx"
@@ -892,8 +891,8 @@ def select_runtime(model_id: str) -> LocalRuntime:
 class QwenBackend:
     """Qwen3.5, run locally, shown video.
 
-    The model is loaded lazily on first `generate`, so constructing a backend costs nothing and the
-    notebook's correctness checks run with no weights on disk -- the same reason `GeminiBackend`
+    The model is loaded lazily on first `generate`, so constructing a backend costs nothing and a
+    caller's correctness checks run with no weights on disk -- the same reason `GeminiBackend`
     builds its client lazily.
 
     **A window becomes a trimmed segment.** Neither local runtime accepts a time range, so the clip
@@ -949,9 +948,9 @@ class QwenBackend:
             "backend": "qwen",
             "model_id": self.model_id,
             "runtime": self._runtime.name,
-            # None until something has loaded: `find_interactions` reads this outside the try that
-            # catches a failing generate, so a version lookup that raised -- or a load forced just to
-            # answer it -- would turn one recorded window failure into a lost run.
+            # None until something has loaded: this is read while recording a run, outside the try
+            # that catches a failing generate, so a version lookup that raised -- or a load forced
+            # just to answer it -- would turn one recorded window failure into a lost run.
             "device": self._runtime.device,
             "runtime_version": self._runtime.version,
             "fps": LOCAL_FPS,

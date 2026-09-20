@@ -2,8 +2,8 @@
 
 Every ffprobe call in the project is here, so the two questions worth asking of a clip -- its
 stream's shape and its duration -- are answered in one place and phrased the same way. ffmpeg is
-not the same story: `require_binary` lives here, but `overlay` and `vlm` build and run their own
-ffmpeg commands, because what they ask it to do is theirs.
+not the same story: `require_binary` lives here, but the ffmpeg commands themselves are built and
+run by whoever needs one, because what they ask it to do is theirs.
 
 Nothing first-party is imported here, so anything in the package may depend on this module.
 """
@@ -30,7 +30,7 @@ def _ffprobe(source: Path, *entries: str) -> Any:
     rather than the file's. What the answer means is the caller's business.
 
     A `JSONDecodeError` propagates. ffprobe exiting zero and then writing something unparseable is
-    not a case either caller handles, and inventing a friendlier error for it here would be a
+    not a case the probes below handle, and inventing a friendlier error for it here would be a
     behaviour change dressed as plumbing.
     """
     completed = subprocess.run(

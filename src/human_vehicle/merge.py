@@ -46,8 +46,7 @@ class MergedInteraction(BaseModel):
     """One event, assembled from every record that reported it.
 
     Not a drop-in for `Interaction` or `ReportedInteraction`: it carries `window_indexes` and
-    `sightings` where a reported record carries a single `window_index`. The notebook's figure
-    helpers read a run's own records, not these.
+    `sightings` where a reported record carries a single `window_index`.
     """
 
     person_ids: list[str] = Field(description="Every label any contributor saw on the person, in order first seen.")
@@ -277,10 +276,10 @@ def merge_interactions(run: InteractionRun, *, confidence_band: float = CONFIDEN
 
     windows = _windows_by_index(run)
     merged = [_merge_group(group, run.interactions, windows, confidence_band) for group in _group(run.interactions)]
-    # Ordered as a run's own list is, with a last key so two events sharing a span still order the
-    # same way every time: this is written to disk and compared across runs.
-    order = {id(item): position for position, item in enumerate(merged)}
-    merged.sort(key=lambda item: (item.start_time_s, item.end_time_s, order[id(item)]))
+    # Ordered as a run's own list is. The sort is stable and `_group`'s order is a function of the
+    # input, so two events sharing a span order the same way every time: this is written to disk and
+    # compared across runs.
+    merged.sort(key=lambda item: (item.start_time_s, item.end_time_s))
 
     return MergedInteractions(
         clip_id=run.clip_id,

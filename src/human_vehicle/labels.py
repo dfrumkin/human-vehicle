@@ -31,7 +31,7 @@ def label_text(category: Category, track_id: int) -> str:
     """The label for one object, e.g. `"P3"`.
 
     The single place a label string is formed, so the translation `relabel_tracks` returns and the
-    glyphs `overlay` draws cannot disagree.
+    glyphs drawn on the clip cannot disagree.
     """
     return f"{CATEGORY_INITIALS[category]}{track_id}"
 

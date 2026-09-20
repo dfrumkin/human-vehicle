@@ -14,14 +14,14 @@ each one carries the **track labels** the overlay put on that person and that ve
 An ideal detector-tracker would give each object exactly one label for the whole clip. A real one
 gives none, one, or several -- a person can go unlabelled for a stretch and come back under a new
 number -- so these are lists, in the order the labels were first seen, and an empty one is a normal
-answer rather than a failure. They are what lets `human_vehicle.merge` recognise the same interaction
-seen by two overlapping windows as one event. Nothing here merges anything: a run's record keeps
-every sighting.
+answer rather than a failure. They are what lets a later merge recognise the same interaction seen
+by two overlapping windows as one event. Nothing here merges anything: a run's record keeps every
+sighting.
 
 **Windowed runs assume the backend reports times on the clip's clock** when it is shown only a
 segment of the clip. The prompt says so and the validator holds the answer to it, but neither can
-prove a model obeys: `notebooks/human_vehicle_interactions.ipynb` has a live check that does, and it
-should pass for a backend before its windowed output is believed.
+prove a model obeys: only a live check against a clip whose times are known does, and it should
+pass for a backend before its windowed output is believed.
 
 Which model runs is `human_vehicle.vlm`'s business, not this module's.
 """
@@ -444,13 +444,13 @@ def find_interactions(
     tiles it in 8-second windows advancing 4 seconds, so neighbours overlap by 4. **Counts are not
     comparable between a windowed run and a whole-clip one**: the overlap means one interaction is
     often reported twice, and nothing here de-duplicates. That is deliberate -- the same event seen
-    by two windows is corroboration, and collapsing them is `human_vehicle.merge`'s job, keyed on the
-    track labels reported here.
+    by two windows is corroboration, and collapsing them is a later merge's job, keyed on the track
+    labels reported here.
 
     A windowed run assumes the backend reports times on the **clip's** clock when shown a segment.
     The prompt says so and every record is validated against it, but a model that quietly reverted
-    to segment-local times would shift every windowed timestamp while still looking plausible; the
-    notebook's live timebase check is what verifies that for a given backend.
+    to segment-local times would shift every windowed timestamp while still looking plausible; a
+    live timebase check against a clip whose times are known is what verifies that for a backend.
 
     **A failed call never raises.** It is recorded against its window, so one bad window does not
     cost the run the others, and only a run where every call failed is itself marked failed. Bad
