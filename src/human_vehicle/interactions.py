@@ -29,7 +29,7 @@ Which model runs is `human_vehicle.vlm`'s business, not this module's.
 import json
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -42,8 +42,10 @@ from human_vehicle.video import probe_duration
 from human_vehicle.vlm import VlmBackend, Window, sum_usage
 
 # Bumped whenever the prompt's wording changes, and written into every record: two runs are
-# comparable only if this matches. "a1" is the first prompt written for annotated clips.
-PROMPT_VERSION = "a1"
+# comparable only if this matches. "a1" was the first prompt written for annotated clips; "a2"
+# tightened what it says about the labels, after a model invented two of them on one clip; "a3"
+# balanced that, after "a2" leaned far enough toward silence to invite the opposite mistake.
+PROMPT_VERSION = "a3"
 
 # A track label as `labels.label_text` emits it: the category's letter and an unpadded positive
 # number. Built from the same mapping the prompt's key is built from, so the two cannot drift.
@@ -86,13 +88,24 @@ class ClipInteractions(BaseModel):
 
 
 class ReportedInteraction(Interaction):
-    """An accepted interaction, plus which call produced it.
+    """An accepted interaction, plus which call produced it and which of its labels hold up.
 
-    A subclass rather than a field on `Interaction`, so provenance the model must not be asked for
+    A subclass rather than fields on `Interaction`, so provenance the model must not be asked for
     stays out of the schema sent to it.
+
+    The `unverified_*` lists are empty until `verify_labels` runs, and stay empty for a record whose
+    every label was really on screen. A label in one of them is a label the model reported and the
+    clip does not support -- kept, because a record of what was claimed is the only way to see how
+    often a model invents one.
     """
 
     window_index: int = Field(description="Index of the window whose call reported this.")
+    unverified_person_ids: list[str] = Field(
+        default=[], description="Reported person labels the clip does not support; see `verify_labels`."
+    )
+    unverified_vehicle_ids: list[str] = Field(
+        default=[], description="Reported vehicle labels the clip does not support; see `verify_labels`."
+    )
 
 
 class MalformedInteraction(BaseModel):
@@ -211,9 +224,9 @@ def build_prompt(clip_id: str, duration_s: float, window: Window | None = None) 
 The clip has been annotated automatically. People and vehicles found by a detector and followed by
 a tracker are marked at the corners of their boxes and labelled:
 
-- {person}<number> is a person - {person}1, {person}2, and so on.
-- {vehicle}<number> is a vehicle - {vehicle}1, {vehicle}2, and so on. Cars, motorcycles, buses and
-  trucks are all labelled this way.
+- {person}<number> is a person - for example {person}1 or {person}4.
+- {vehicle}<number> is a vehicle - for example {vehicle}1 or {vehicle}4. Cars, motorcycles, buses
+  and trucks are all labelled this way.
 
 The two numberings are independent, so {person}5 and {vehicle}5 have nothing to do with each other.
 
@@ -241,19 +254,24 @@ Merely walking past a vehicle, standing near one, or crossing in front of or beh
 interaction.
 
 Do not omit a candidate because you are unsure. If you cannot tell whether you are seeing a genuine
-interaction or mere proximity, report it with a confidence below 0.5. Report a clearly visible,
-well-supported interaction with a confidence above 0.8. Several people and vehicles may appear at
-once, and interactions may overlap in time. If the same person and vehicle interact in two clearly
-separated episodes, report two records.
+interaction or mere proximity, report it with a confidence below 0.5. This applies to interactions,
+never to the labels below: those are read, not judged. Report a clearly visible, well-supported
+interaction with a confidence above 0.8. Several people and vehicles may appear at once, and
+interactions may overlap in time. If the same person and vehicle interact in two clearly separated
+episodes, report two records.
 
-For each interaction, report the labels the video showed on the two objects involved:
-- person_ids: each distinct label that person carried during the interaction, in the order you
-  first saw it. A person labelled {person}1, then unlabelled, then {person}4 is
-  ["{person}1", "{person}4"], and one that flickers between two labels is those two labels, once
-  each.
+For each interaction, report the labels you can READ on the two objects, in a frame inside the span
+you are reporting:
+- person_ids: each distinct label that person carried, in the order you first saw it. One frame is
+  enough: a person labelled {person}1 who is then unlabelled is ["{person}1"], not [], and one
+  labelled {person}1, then unlabelled, then {person}4 is ["{person}1", "{person}4"].
 - vehicle_ids: the same for the vehicle.
-Report an empty list when the object carried no label at any point. Never invent a label, and never
-report one you did not actually read in the video.
+
+Read labels; never assign them. The numbers are already in the image and are not a count of what
+you noticed - the third person you see is not necessarily {person}3. Report an empty list only when
+the object carried no label at any moment of the interaction. Both mistakes cost the same: a
+guessed label is false information, and dropping one you did read throws away the only handle on
+that object.
 
 Report times as seconds from the start of the clip, as decimal numbers - for example 4.5, not
 "00:04". Fractional seconds are expected and useful; do not round to whole seconds.
@@ -536,6 +554,82 @@ def find_interactions(
         # is carried by failed_windows and only a total loss is an error.
         error=f"all {len(runs)} call(s) failed" if failed == len(runs) else None,
         elapsed_s=time.perf_counter() - started,
+    )
+
+
+def _on_screen(times: Sequence[float] | None, low: float, high: float) -> bool:
+    """Was a label drawn at any moment in [low, high]? `None` is a label never drawn at all."""
+    return times is not None and any(low <= time <= high for time in times)
+
+
+def _verify_interaction(
+    item: ReportedInteraction, times: Mapping[str, Sequence[float]], tolerance: float
+) -> ReportedInteraction:
+    """One record with its unsupported labels moved aside. Returned unchanged when all hold up."""
+    low, high = item.start_time_s - tolerance, item.end_time_s + tolerance
+    updates: dict[str, list[str]] = {}
+    for reported_field, unverified_field in (
+        ("person_ids", "unverified_person_ids"),
+        ("vehicle_ids", "unverified_vehicle_ids"),
+    ):
+        reported: list[str] = getattr(item, reported_field)
+        supported = [label for label in reported if _on_screen(times.get(label), low, high)]
+        if len(supported) == len(reported):
+            continue
+        updates[reported_field] = supported
+        # Appended rather than assigned, so running this twice cannot discard what the first pass
+        # found. Nothing calls it twice today; the alternative is a silent loss if anything ever does.
+        unsupported = [label for label in reported if label not in supported]
+        updates[unverified_field] = [*getattr(item, unverified_field), *unsupported]
+    return item.model_copy(update=updates) if updates else item
+
+
+def verify_labels(run: InteractionRun, times: Mapping[str, Sequence[float]], *, tolerance_s: float) -> InteractionRun:
+    """Hold every reported label against the clip, and move aside the ones it does not support.
+
+    A label is supported when it was drawn at some moment within `tolerance_s` of the span the
+    record claims. `times` is `labels.label_times` of the record the clip was rendered from -- the
+    renumbered one, whose keys are the glyphs a model could actually have read.
+
+    **A model does invent labels.** One run here reported `P5` twice at 0.90 confidence and `P6` at
+    0.95 on a clip whose tracker drew three people, none of them either; another attached a real
+    `P2` to a span four seconds after `P2` had left. `validate_interaction` cannot see this -- it
+    checks a label's shape against a regex, and an invented label is shaped like any other.
+
+    What comes back is a copy. Each unsupported label moves from `person_ids` / `vehicle_ids` to
+    `unverified_person_ids` / `unverified_vehicle_ids`, keeping order, and nothing else changes: the
+    times, the descriptions and the confidence are the model's own, and the interaction is very
+    likely real -- an unlabelled person handling a vehicle is exactly what the prompt asks to be
+    reported with an empty list.
+
+    This matters most to merging, which keys on the id lists. Two records from adjacent windows
+    sharing only an invented label would otherwise collapse into one event whose `sightings: 2`
+    claims a corroboration that never happened. An empty list never merges, by design, so moving the
+    label is all it takes.
+
+    `run.malformed` is left alone: those records failed validation and are kept exactly as they
+    arrived. Every accepted record is verified in both places it appears -- the run's own list and
+    its window's -- so the file cannot say two different things about one record.
+
+    The span is what is checked, not `evidence_time_s`, because the span is what the record claims.
+    The tolerance should be the backend's own `tolerance_s`: a model that can only place a moment to
+    within half a second, read against a clip whose frames are 0.15 s apart, would otherwise have
+    correct labels stripped by rounding.
+    """
+    return run.model_copy(
+        update={
+            "interactions": [_verify_interaction(item, times, tolerance_s) for item in run.interactions],
+            # Verified independently rather than by sharing the objects above: a run that has been
+            # through a file is a run whose two lists hold equal records, not identical ones.
+            "windows": [
+                window.model_copy(
+                    update={
+                        "interactions": [_verify_interaction(item, times, tolerance_s) for item in window.interactions]
+                    }
+                )
+                for window in run.windows
+            ],
+        }
     )
 
 

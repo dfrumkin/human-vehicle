@@ -12,6 +12,7 @@ translation from the original identities so a run can still be traced back to wh
 
 from collections.abc import Mapping
 from dataclasses import replace
+from fractions import Fraction
 
 from human_vehicle.tracking import Category, VideoTracks
 
@@ -82,3 +83,30 @@ def relabel_tracks(tracks: VideoTracks) -> tuple[VideoTracks, dict[Identity, str
         (category, track_id): label_text(category, number) for (category, track_id), number in renumbered.items()
     }
     return replace(tracks, frames=frames), translation
+
+
+def label_times(tracks: VideoTracks) -> dict[str, list[float]]:
+    """When each label was on screen: the times in seconds of the frames it appears in.
+
+    Keyed by the label as it was drawn, so `"P3"` maps to every moment a `P3` was in the picture.
+    A label absent from the mapping was never drawn at all.
+
+    Pass the record that was rendered -- the renumbered one. The keys are the glyphs in the pixels,
+    so a record that was not renumbered gives a mapping keyed by the tracker's own sparse ids, which
+    are not what a model reading the clip can have seen.
+
+    A frame's time is its own `index` over the frame rate, not its position in the list. The two
+    agree for any record the renderer would accept, since it refuses one that is not in frame order,
+    but the index is what ties a time to the frame the tracker actually saw.
+
+    The times are what `interactions.verify_labels` holds a model's reported labels against, which
+    is why this is a flat list per label rather than intervals: a tracker drops a label for a frame
+    and picks it up again constantly, and collapsing those gaps would claim the label was on screen
+    through a stretch where it was not.
+    """
+    fps = float(Fraction(tracks.fps))
+    times: dict[str, list[float]] = {}
+    for frame in tracks.frames:
+        for box in frame.boxes:
+            times.setdefault(label_text(box.category, box.track_id), []).append(frame.index / fps)
+    return times

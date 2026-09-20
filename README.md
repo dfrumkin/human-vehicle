@@ -1,8 +1,9 @@
 # human-vehicle
 
 Interview homework: analyzing humans and vehicles in video, using OpenCV, Pillow, matplotlib,
-and a vision-language model — Gemini, or Qwen3.5 run locally. Work happens in Jupyter notebooks;
-reusable code lives in `src/human_vehicle/`.
+and a vision-language model — Gemini, or Qwen3.5 run locally. One command runs a folder of clips
+end to end; the Jupyter notebooks are where what came back is looked at. Reusable code lives in
+`src/human_vehicle/`.
 
 ## Prerequisites
 
@@ -29,12 +30,104 @@ uv run pre-commit install
 ## Daily commands
 
 ```bash
+uv run human-vehicle Videos/ outputs/   # the whole pipeline, clips in, answers out
 uv run jupyter lab             # notebooks
 uv run pytest                  # tests
 uv run ruff check .            # lint (add --fix to apply fixes)
 uv run ruff format .           # format
 uv run pyright --warnings      # type check; warnings fail too
 ```
+
+## Running the whole pipeline
+
+One command takes a clip, or a folder of them, and writes both outputs for each: the annotated mp4
+with every person and vehicle marked, and the JSON record of the interactions a vision-language
+model read out of that render.
+
+```bash
+uv run human-vehicle Videos/ outputs/
+uv run human-vehicle Videos/gt1125_06.mp4 outputs/ --whole-clip
+uv run human-vehicle Videos/ outputs/ --vlm local --vlm-model mlx-community/Qwen3.5-9B-4bit
+```
+
+A folder input is searched for `*.mp4`, not recursively. Anything already under the output folder is
+skipped, so pointing the output inside the input folder cannot feed a previous run's annotated clips
+back in — an annotated clip annotated a second time produces a run that looks perfectly normal and
+answers a different question.
+
+### What it writes
+
+```
+outputs/annotated/<clip>__<tracking config>.mp4
+outputs/interactions/<clip>__<tracking config>/<run tag>.json
+outputs/interactions/<clip>__<tracking config>/<run tag>__merged.json
+```
+
+The names carry the configuration, so one output folder holds several runs side by side rather than
+overwriting: `<tracking config>` is `config_slug` of the record the run produced, and `<run tag>` is
+the model's configuration plus the moment the run started. The timestamp matters — two runs at
+identical settings genuinely differ, and comparing them is how a real difference is told from noise.
+Every path written is printed as it goes.
+
+The merged file appears for a windowed run only, and is written after the record it derives from.
+It is regenerable; the record of what the model said is not. Check `failed_windows` and
+`malformed_count` in it before trusting it, as ever.
+
+This is the layout the notebooks use, so `notebooks/human_vehicle_interactions.ipynb` will read a
+folder this wrote. **Reach for the script to process clips and the notebooks to look at what came
+back** — the filmstrips, the uncovered sheet and the two-arm comparison are all there, and none of
+them are here.
+
+### The parameters
+
+| Flag | Default | What it is |
+| --- | --- | --- |
+| `input` | *required* | a video file, or a folder searched for `*.mp4` |
+| `output` | *required* | where to write; created if it does not exist |
+| `--weights` | `yolo26x.pt` | the detector |
+| `--tracker` | `tracktrack.yaml` | the tracker, or a path to your own YAML |
+| `--reid` | `yolo26x-reid.onnx` | `none`, `auto`, or a ReID model |
+| `--imgsz` | `auto` | 1280 on frames 1080 px tall or more, else 640 |
+| `--buffer-seconds` | `3.0` | how long a lost track stays re-findable |
+| `--vlm` | `gemini` | `gemini`, or `local` for Qwen3.5 on your own machine |
+| `--vlm-model` | `gemini-3.8-flash` | required under `--vlm local`, where the right id differs per machine |
+| `--window-s` / `--stride-s` | `8.0` / `4.0` | the windowing |
+| `--whole-clip` | off | one call over the whole clip instead |
+| `--seed` | `1` | whichever backend runs |
+| `--fps`, `--resolution`, `--thinking-level`, `--max-output-tokens` | `2.0`, `low`, `medium`, `8192` | Gemini only |
+| `--max-new-tokens` | `8192` | local only |
+
+**The tracking defaults are the ones this project runs with, not the library's.** `track_video`
+defaults to `yolo26s.pt` and no ReID; the work here has been done with the largest detector and a
+matched ReID encoder, and those are what the script asks for.
+
+A setting belonging to the backend that is not running is an error rather than a silent no-op, and
+so is `--window-s` alongside `--whole-clip`. Passing `--thinking-level high --vlm local` must not
+look like it did something.
+
+### What to know before a batch
+
+- **A clip that fails costs only itself.** It is reported, the batch goes on, and the exit code is 1
+  if any clip went unanswered. A clip whose calls all failed counts as unanswered, however complete
+  its record looks.
+- **Gemini means the footage leaves the machine.** Each annotated clip is uploaded, and the uploads
+  are deleted when the run ends, including when it is interrupted. See
+  [Choosing the model](#choosing-the-model) for the retention this does and does not cover.
+- **`GEMINI_API_KEY`** is read from the repository's `.env`, found by searching upward from where you
+  run the command. Run it from outside the repository and the key has to be in the environment.
+- **A windowed run assumes the model reports times on the clip's clock.** The script does not
+  re-verify that; the live check in `notebooks/human_vehicle_interactions.ipynb` does, and is worth
+  re-running there after an SDK or model change. See [Windowing](#windowing).
+- **Reported labels are checked against the clip**, and a line goes to stderr naming any the clip
+  does not support:
+
+  ```
+  iMGR_0AG3a8_2_3__...: 4 unsupported label(s) in 3 record(s): P2 x1, P5 x2, P6 x1
+  ```
+
+  The run still succeeds and the records are still written — the labels are moved aside, not
+  dropped. A line like that says how much to trust that clip's id lists. See
+  [A model does invent labels](#a-model-does-invent-labels).
 
 ## Detection and tracking
 
@@ -223,6 +316,67 @@ event: the spans overlap in time and the labels agree. **`find_interactions` its
 nothing** — the second sighting is corroboration, and a run's record keeps every one. Collapsing them
 is a separate, pure step: see [Merging what the windows saw](#merging-what-the-windows-saw).
 
+### A model does invent labels
+
+The labels above are what the model claims it read. It sometimes reports one that was never there.
+On one clip here it reported `P5` twice at 0.90 confidence and `P6` at 0.95, on a clip whose tracker
+drew three people and none of them either; on another record it attached a real `P2` to a span four
+seconds after `P2` had left the picture.
+
+`validate_interaction` cannot see this. It checks a label's *shape* — `P` and a number — and an
+invented label is shaped like any other.
+
+The prompt asks for a label to be *read* rather than assigned, says the numbers are not a count of
+what the model noticed, and holds both mistakes to cost the same: a guessed label is false
+information, and dropping one that was there throws away the only handle on that object. Both
+halves are needed — `a2` said only the first and leaned far enough toward silence to invite the
+opposite error, which is why the current version is `a3`.
+
+**Treat the wording as a reduction, not a guarantee.** On the clip above the same two invented
+labels came back from four runs across two prompt versions, so the wording has not been shown to
+fix anything; and the same record answered correctly in two of those runs and wrongly in the other
+two, so a single run per setting says nothing either way. The check below is what the answer rests
+on.
+
+So `verify_labels` holds each reported label against the clip:
+
+```python
+from human_vehicle.interactions import verify_labels
+from human_vehicle.labels import label_times
+
+run = verify_labels(run, label_times(relabelled), tolerance_s=backend.tolerance_s)
+```
+
+A label is **supported** when it was drawn at some moment within `tolerance_s` of the span the
+record claims. The span, because that is what the record claims; the tolerance is the backend's own,
+because a model that places a moment to within half a second, read against frames 0.15 s apart,
+would otherwise have correct labels stripped by rounding. A label never drawn at all fails the same
+test, so one rule covers both cases above.
+
+An unsupported label **moves rather than disappears**:
+
+```json
+{"person_ids": [], "unverified_person_ids": ["P6"], "vehicle_ids": ["V4"], ...}
+```
+
+Nothing else changes — the times, the descriptions and the confidence are the model's own, and the
+interaction is very likely real. `P6` above is a person genuinely closing a car's rear door, whom
+the tracker had as `P3` until it lost them three seconds earlier. An empty `person_ids` is the
+answer the prompt asks for in that case, and the record now gives it, while
+`unverified_person_ids` keeps what was claimed so the rate of invention stays measurable.
+
+**This matters most to merging**, which keys on the id lists. Two records from adjacent windows
+sharing only an invented label would otherwise collapse into one event whose `sightings: 2` claims a
+corroboration that never happened — which is exactly what `P5` did above. An empty list never
+merges, by design, so moving the label is all it takes. On that clip the merge goes from six events
+to seven, and the one genuine two-window sighting is untouched.
+
+`run.malformed` is left alone: those records failed validation and are kept exactly as they arrived.
+
+The check needs the tracking record the clip was rendered from, so it runs in the pipeline, where
+both are in hand. The notebooks read a folder of annotated clips with no tracking record and cannot
+do it.
+
 ### What comes back
 
 An `InteractionRun`: the interactions, the records that failed validation, the per-call detail, the
@@ -378,6 +532,11 @@ is still the right trade. One clip here has an unlabelled person entering a car'
 labelled one exits its passenger side, overlapping in time at the same vehicle. Merging on the
 vehicle alone would fuse them into a person who did both at once, and nothing downstream could tell.
 A missed merge leaves visible duplicates; a wrong merge invents an event that never happened.
+
+**A record whose only ids were invented becomes one of these.** `verify_labels` moves a label the
+clip does not support out of the id list, so a record left with nothing to match on passes through
+alone — which is the point: the alternative is two windows merging on a label that was never drawn.
+See [A model does invent labels](#a-model-does-invent-labels).
 
 ### Which record is believed
 

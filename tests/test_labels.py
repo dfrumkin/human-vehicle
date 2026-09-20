@@ -3,7 +3,7 @@
 from dataclasses import replace
 from pathlib import Path
 
-from human_vehicle.labels import label_text, relabel_tracks
+from human_vehicle.labels import label_text, label_times, relabel_tracks
 from human_vehicle.tracking import Category, FrameTracks, TrackedBox, VideoTracks
 
 # A vehicle's COCO class, and the category it groups into. Two different classes here is the point:
@@ -169,3 +169,41 @@ def test_an_empty_record_renumbers_to_nothing() -> None:
 
     assert translation == {}
     assert relabelled == tracks
+
+
+def test_label_times_reports_each_label_against_the_frames_it_appears_in() -> None:
+    """The times a reported label is later held against, on a clip whose rate is not an integer.
+
+    30000/1001 is 29.97 fps, which is what these clips really carry; a rate rounded to 30 would put
+    the last frame of a long clip almost a frame out, and the check this feeds is a comparison
+    against a model's own times.
+    """
+    tracks = _tracks(
+        [
+            [_box(1, "person")],
+            [_box(1, "person"), _box(2, "car")],
+            [_box(2, "car")],
+        ]
+    )
+
+    times = label_times(tracks)
+
+    # Keyed by the label the record would be drawn with, so the car's own track id is its number.
+    fps = 30000 / 1001
+    assert times == {"P1": [0.0, 1 / fps], "V2": [1 / fps, 2 / fps]}
+
+
+def test_a_label_never_drawn_is_absent_rather_than_empty() -> None:
+    """`verify_labels` reads a missing key as "never on screen", so the two must not be confused."""
+    times = label_times(_tracks([[_box(1, "person")]]))
+
+    assert "V1" not in times
+
+
+def test_label_times_follows_the_frame_index_not_the_position() -> None:
+    """A frame's time is the frame's own index, which is what ties it to what the tracker saw."""
+    tracks = _tracks([[_box(1, "person")], [_box(1, "person")]])
+    shifted = replace(tracks, frames=tuple(replace(frame, index=frame.index + 10) for frame in tracks.frames))
+
+    fps = 30000 / 1001
+    assert label_times(shifted) == {"P1": [10 / fps, 11 / fps]}

@@ -40,6 +40,10 @@ dependencies = [
     "ultralytics>=8.4.154",
 ]
 
+[project.scripts]
+# The end-to-end run: clips in, annotated video and interaction records out.
+human-vehicle = "human_vehicle.pipeline:main"
+
 [dependency-groups]
 dev = [
     "jupyterlab>=4.4",

@@ -13,7 +13,10 @@ import pytest
 
 from human_vehicle.interactions import (
     PROMPT_VERSION,
+    ClipInteractions,
     InteractionRun,
+    ReportedInteraction,
+    WindowRun,
     build_prompt,
     find_interactions,
     make_windows,
@@ -21,7 +24,9 @@ from human_vehicle.interactions import (
     run_slug,
     run_tag,
     validate_interaction,
+    verify_labels,
 )
+from human_vehicle.merge import merge_interactions
 from human_vehicle.vlm import VlmResponse, Window
 from tests.conftest import MakeVideo
 
@@ -387,7 +392,12 @@ def test_the_prompt_states_the_contract_the_answer_is_judged_against(make_video:
     # of the clip" is marked out of range.
     assert "<= 27.3" in prompt
     assert "best-effort reference rather than\nground truth" in prompt
-    assert "empty list when the object carried no label" in prompt
+    # A model does invent labels, so the prompt asks for a reading rather than a name -- and holds
+    # the opposite mistake to be just as costly, or it trades invention for silence.
+    assert "Read labels; never assign them" in prompt
+    assert "empty list only when\nthe object carried no label at any moment of the interaction" in prompt
+    assert "Both mistakes cost the same" in prompt
+    assert "One frame is\n  enough" in prompt
 
 
 def test_a_repeat_run_does_not_overwrite_the_one_before_it(make_video: MakeVideo) -> None:
@@ -458,3 +468,132 @@ def test_a_whole_clip_call_is_unaffected_by_the_prompt_clock(make_video: MakeVid
     find_interactions(clip, local, clip_id="clip")
 
     assert plain.calls[0]["prompt"] == local.calls[0]["prompt"]
+
+
+# --- Holding reported labels against the clip --------------------------------------------------
+
+
+def _reported(
+    person_ids: list[str], vehicle_ids: list[str], *, start: float, end: float, window_index: int = 0
+) -> ReportedInteraction:
+    return ReportedInteraction.model_validate(
+        {
+            **GOOD,
+            "person_ids": person_ids,
+            "vehicle_ids": vehicle_ids,
+            "start_time_s": start,
+            "evidence_time_s": start,
+            "end_time_s": end,
+            "window_index": window_index,
+        }
+    )
+
+
+def _run_of(*items: ReportedInteraction) -> InteractionRun:
+    """A run holding `items`, each also in its own window, as `find_interactions` assembles one."""
+    windows = [
+        WindowRun(
+            window_index=index,
+            start_s=0.0,
+            end_s=DURATION,
+            prompt="p",
+            interactions=[item for item in items if item.window_index == index],
+        )
+        for index in sorted({item.window_index for item in items})
+    ]
+    return InteractionRun(
+        source="annotated.mp4",
+        clip_id="clip",
+        duration_s=DURATION,
+        prompt_version=PROMPT_VERSION,
+        backend_config={},
+        backend_slug="stub",
+        windows=windows,
+        interactions=list(items),
+    )
+
+
+def test_a_label_never_drawn_is_moved_aside() -> None:
+    """The `P6` case: the interaction was real, the label was not."""
+    run = _run_of(_reported(["P6"], ["V4"], start=19.3, end=24.3))
+
+    verified = verify_labels(run, {"V4": [20.0]}, tolerance_s=0.5)
+
+    item = verified.interactions[0]
+    assert (item.person_ids, item.unverified_person_ids) == ([], ["P6"])
+    assert (item.vehicle_ids, item.unverified_vehicle_ids) == (["V4"], [])
+    # Only the ids move. What the model saw is not in question.
+    assert (item.start_time_s, item.end_time_s, item.confidence) == (19.3, 24.3, GOOD["confidence"])
+
+
+def test_a_label_drawn_only_outside_the_span_is_moved_aside() -> None:
+    """The `P2` case, and why the rule is temporal rather than a check that the label exists."""
+    run = _run_of(_reported(["P2"], [], start=17.5, end=20.0))
+
+    verified = verify_labels(run, {"P2": [14.25, 15.6]}, tolerance_s=0.5)
+
+    assert (verified.interactions[0].person_ids, verified.interactions[0].unverified_person_ids) == ([], ["P2"])
+
+
+def test_a_label_drawn_inside_the_span_survives() -> None:
+    run = _run_of(_reported(["P1"], ["V4"], start=6.0, end=8.5))
+
+    verified = verify_labels(run, {"P1": [7.0], "V4": [7.0]}, tolerance_s=0.5)
+
+    item = verified.interactions[0]
+    assert (item.person_ids, item.vehicle_ids) == (["P1"], ["V4"])
+    assert (item.unverified_person_ids, item.unverified_vehicle_ids) == ([], [])
+
+
+def test_a_label_just_outside_the_span_survives_on_tolerance() -> None:
+    """Too tight a rule would strip correct labels on rounding, which is the worse failure."""
+    run = _run_of(_reported(["P3"], [], start=21.0, end=24.0))
+
+    within = verify_labels(run, {"P3": [20.85]}, tolerance_s=0.5)
+    beyond = verify_labels(run, {"P3": [20.85]}, tolerance_s=0.1)
+
+    assert within.interactions[0].person_ids == ["P3"]
+    assert beyond.interactions[0].person_ids == []
+
+
+def test_vehicles_are_held_to_the_same_rule() -> None:
+    run = _run_of(_reported([], ["V9"], start=4.0, end=8.0))
+
+    verified = verify_labels(run, {"V1": [5.0]}, tolerance_s=0.5)
+
+    assert (verified.interactions[0].vehicle_ids, verified.interactions[0].unverified_vehicle_ids) == ([], ["V9"])
+
+
+def test_both_copies_of_a_record_agree() -> None:
+    """A record lives in the run's list and in its window's; a file cannot say two things about it."""
+    run = _run_of(_reported(["P6"], ["V4"], start=19.3, end=24.3, window_index=0))
+
+    verified = verify_labels(run, {"V4": [20.0]}, tolerance_s=0.5)
+
+    assert verified.windows[0].interactions[0].person_ids == []
+    assert verified.windows[0].interactions[0].unverified_person_ids == ["P6"]
+    assert verified.interactions[0] == verified.windows[0].interactions[0]
+
+
+def test_records_sharing_only_an_invented_label_no_longer_merge() -> None:
+    """The bug this exists for: an invented id manufactured a second sighting of one event.
+
+    Window 3 reported ["P2", "P5"] and window 4 ["P5"], and they collapsed into one event at
+    `sightings: 2` on the strength of a `P5` the tracker never drew.
+    """
+    run = _run_of(
+        _reported(["P2", "P5"], ["V4"], start=17.5, end=20.0, window_index=0),
+        _reported(["P5"], ["V4"], start=18.0, end=24.0, window_index=1),
+    )
+    times = {"V4": [18.0, 19.0, 20.0], "P2": [14.25, 15.6]}
+
+    assert len(merge_interactions(run).interactions) == 1, "the unverified run merges them into one"
+    assert len(merge_interactions(verify_labels(run, times, tolerance_s=0.5)).interactions) == 2
+
+
+def test_the_model_is_never_asked_for_the_verification_fields() -> None:
+    """Moving these onto `Interaction` would put provenance into the request sent to the model."""
+    properties = ClipInteractions.model_json_schema()["$defs"]["Interaction"]["properties"]
+
+    assert "unverified_person_ids" not in properties
+    assert "unverified_vehicle_ids" not in properties
