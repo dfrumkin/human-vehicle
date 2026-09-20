@@ -9,12 +9,15 @@ The defaults are the ones the notebooks use, not the library's: `track_video` de
 `yolo26s.pt` with no ReID, where the work on these clips has been done with `yolo26x.pt` and a
 matched ReID encoder.
 
-The output layout is the notebooks' too, so one output folder holds several configurations without
-collisions and `notebooks/human_vehicle_interactions.ipynb` can read what this wrote:
+A clip that runs through leaves two files side by side, both named after it:
 
-    <output>/annotated/<clip>__<tracking config>.mp4
-    <output>/interactions/<clip>__<tracking config>/<run tag>.json
-    <output>/interactions/<clip>__<tracking config>/<run tag>__merged.json
+    <output>/<clip>.mp4     the annotated render
+    <output>/<clip>.json    the merged interactions
+
+Nothing else is written. The run record -- the raw model text, the per-call usage, the per-window
+detail -- is used here and then discarded, and an unsupported label is reported on stderr and
+nowhere else. Names carry no configuration, so a second run over a clip replaces the first:
+comparing two configurations means two output folders.
 """
 
 import argparse
@@ -28,11 +31,11 @@ from typing import Any
 
 from dotenv import find_dotenv, load_dotenv
 
-from human_vehicle.interactions import InteractionRun, find_interactions, run_tag, verify_labels
+from human_vehicle.interactions import InteractionRun, find_interactions, verify_labels
 from human_vehicle.labels import label_times, relabel_tracks
 from human_vehicle.merge import merge_interactions, merge_summary
 from human_vehicle.overlay import render_tracked_video
-from human_vehicle.tracking import Category, config_slug, track_video
+from human_vehicle.tracking import Category, track_video
 from human_vehicle.video import probe_stream
 from human_vehicle.vlm import DEFAULT_MODEL_ID, GeminiBackend, QwenBackend, VlmBackend
 
@@ -89,7 +92,6 @@ class ClipResult:
     source: Path
     annotated: Path | None = None
     record: Path | None = None
-    merged: Path | None = None
     people: int = 0
     vehicles: int = 0
     run: InteractionRun | None = None
@@ -113,20 +115,30 @@ def imgsz_for(height: int) -> int:
 def discover_videos(source: Path, output_dir: Path) -> list[Path]:
     """The clips to run: `source` itself if it is a file, else every mp4 directly inside it.
 
-    Anything under `output_dir` is skipped. Pointing the output inside the input folder is an
-    ordinary thing to do, and without this a second run would find the first run's annotated clips
-    and annotate them again -- a run that looks entirely normal and answers a different question.
+    A clip whose annotated render would be written over the clip itself is refused. The annotated
+    file is named after its source now, so pointing the output at a clip's own folder -- an
+    ordinary thing to do -- aims the render at the input. `render_tracked_video` refuses that too,
+    so the clip is safe either way; refusing here is what makes it cost nothing, since the render's
+    own check fires only after a tracking pass, which is minutes on a 4K clip.
     """
     if source.is_file():
-        return [source]
-    if not source.is_dir():
+        videos = [source]
+    elif source.is_dir():
+        videos = sorted(source.glob(VIDEO_PATTERN))
+        if not videos:
+            raise FileNotFoundError(f"no {VIDEO_PATTERN} files in {source}")
+    else:
         raise FileNotFoundError(f"no such file or folder: {source}")
 
-    inside_output = output_dir.resolve()
-    videos = [path for path in sorted(source.glob(VIDEO_PATTERN)) if not path.resolve().is_relative_to(inside_output)]
-    if not videos:
-        raise FileNotFoundError(f"no {VIDEO_PATTERN} files in {source}")
+    for video in videos:
+        if annotated_path(video, output_dir).resolve() == video.resolve():
+            raise ValueError(f"the annotated clip would be written over {video}; use another output folder")
     return videos
+
+
+def annotated_path(source: Path, output_dir: Path) -> Path:
+    """Where `source`'s annotated render goes: beside the output folder's other clips, same name."""
+    return output_dir / f"{source.stem}.mp4"
 
 
 def _given(args: argparse.Namespace, names: Sequence[str]) -> list[str]:
@@ -236,9 +248,7 @@ def process_clip(
     # One entry per identity the tracker found, so this counts objects rather than detections.
     people = sum(1 for category, _ in translation if category is Category.PERSON)
 
-    # From the record the run produced rather than from what was asked for, so a filename cannot
-    # claim a configuration that is not the one that made it.
-    annotated = output_dir / "annotated" / f"{source.stem}__{config_slug(relabelled)}.mp4"
+    annotated = annotated_path(source, output_dir)
     render_tracked_video(relabelled, annotated)
     print(
         f"  tracked  {people} people, {len(translation) - people} vehicles at imgsz={imgsz} "
@@ -246,41 +256,36 @@ def process_clip(
     )
 
     window_s, stride_s = window if window is not None else (None, None)
-    # No clip_id: it defaults to the annotated clip's stem, which carries the tracking slug, so the
-    # folder a record lands in says which tracking configuration produced the video the model read.
-    run = find_interactions(annotated, backend, window_s=window_s, stride_s=stride_s)
+    # The source clip names the run, not the file the model was shown. The two stems are the same
+    # string today; saying which one is meant keeps that from being an accident.
+    run = find_interactions(annotated, backend, window_s=window_s, stride_s=stride_s, clip_id=source.stem)
 
     # Against the record that was rendered, so the labels checked are the glyphs the model saw.
     run = verify_labels(run, label_times(relabelled), tolerance_s=backend.tolerance_s)
     unverified = _unverified_summary(run)
     if unverified is not None:
+        # The only account of what the model claimed: the merged file carries the surviving ids and
+        # has nowhere to put the quarantined ones, so a label invented here is said once, and here.
         print(f"{run.clip_id}: {unverified}", file=sys.stderr)
 
-    record = output_dir / "interactions" / run.clip_id / f"{run_tag(run)}.json"
-    record.parent.mkdir(parents=True, exist_ok=True)
-    record.write_text(run.model_dump_json(indent=2), encoding="utf-8")
     note = run.error or (
         f"{len(run.interactions)} interaction(s), {len(run.malformed)} malformed"
         + (f", {run.failed_windows} call(s) FAILED" if run.failed_windows else "")
         + f", ${run.usage.get('estimated_cost_usd', 0.0):.4f}"
     )
-    print(f"  asked    {note} in {run.elapsed_s:.1f}s -> {record}")
+    print(f"  asked    {note} in {run.elapsed_s:.1f}s")
 
-    merged_path: Path | None = None
-    if run.windowed:
-        # Only once the record is safely on disk. The calls were paid for; the merged file is
-        # derived and regenerable, and `merge_interactions` can raise on a record naming a window
-        # that does not exist. That must cost the derived file, never the record of what was said.
-        merged = merge_interactions(run)
-        merged_path = record.with_name(f"{run_tag(run)}__merged.json")
-        merged_path.write_text(merged.model_dump_json(indent=2), encoding="utf-8")
-        print(f"  merged   {merge_summary(merged)} -> {merged_path}")
+    # A whole-clip run is merged too: `merge_interactions` runs on any run, and one call reporting
+    # each event once simply leaves it nothing to collapse. One file shape, whichever way it ran.
+    merged = merge_interactions(run)
+    record = output_dir / f"{source.stem}.json"
+    record.write_text(merged.model_dump_json(indent=2), encoding="utf-8")
+    print(f"  merged   {merge_summary(merged)} -> {record}")
 
     return ClipResult(
         source=source,
         annotated=annotated,
         record=record,
-        merged=merged_path,
         people=people,
         vehicles=len(translation) - people,
         run=run,

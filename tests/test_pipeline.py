@@ -44,20 +44,14 @@ def test_a_folder_input_is_every_mp4_in_it_in_name_order(tmp_path: Path) -> None
     assert [path.name for path in found] == ["a.mp4", "b.mp4"]
 
 
-def test_clips_under_the_output_folder_are_not_picked_up(tmp_path: Path) -> None:
-    """Writing the output inside the input folder must not feed a previous run back in.
+@pytest.mark.parametrize("as_folder", [False, True])
+def test_an_output_folder_that_would_swallow_the_clip_is_refused(tmp_path: Path, as_folder: bool) -> None:
+    """The annotated render is named after its source, so a clip's own folder aims it at the clip."""
+    clip = tmp_path / "clip.mp4"
+    clip.touch()
 
-    An annotated clip re-annotated produces a run that looks entirely normal and answers a
-    different question, so this cannot be left to the reader noticing.
-    """
-    (tmp_path / "clip.mp4").touch()
-    output = tmp_path / "out" / "annotated"
-    output.mkdir(parents=True)
-    (output / "clip__yolo26x.mp4").touch()
-
-    found = pipeline.discover_videos(tmp_path, tmp_path / "out")
-
-    assert [path.name for path in found] == ["clip.mp4"]
+    with pytest.raises(ValueError, match="would be written over"):
+        pipeline.discover_videos(tmp_path if as_folder else clip, tmp_path)
 
 
 def test_a_folder_with_no_clips_fails_naming_the_pattern(tmp_path: Path) -> None:
@@ -186,7 +180,7 @@ def _run(**overrides: Any) -> InteractionRun:
     window.interactions = [interaction]
     fields: dict[str, Any] = {
         "source": "annotated.mp4",
-        "clip_id": "clip__yolo26x__tracktrack__reid-none__imgsz640__buf3",
+        "clip_id": "clip",
         "duration_s": 8.0,
         "prompt_version": "a1",
         "backend_config": {},
@@ -221,7 +215,10 @@ def stubbed_stages(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     def fake_find(video: Path, backend: Any, **kwargs: Any) -> InteractionRun:
         calls["window"] = (kwargs.get("window_s"), kwargs.get("stride_s"))
         calls["annotated"] = Path(video)
-        return _run() if kwargs.get("window_s") else _run(window_s=None, stride_s=None)
+        # Honouring `clip_id` the way the real one does, so what the run is named for is visible in
+        # the file the pipeline writes rather than fixed here.
+        named = {"clip_id": kwargs["clip_id"]}
+        return _run(**named) if kwargs.get("window_s") else _run(window_s=None, stride_s=None, **named)
 
     # The labels the clip is taken to have drawn. Supporting the stub run's "P1"/"V1" by default,
     # so a test that cares about the unverified path is the one that empties this.
@@ -232,12 +229,11 @@ def stubbed_stages(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(pipeline, "track_video", fake_track_video)
     monkeypatch.setattr(pipeline, "relabel_tracks", fake_relabel)
     monkeypatch.setattr(pipeline, "render_tracked_video", fake_render)
-    monkeypatch.setattr(pipeline, "config_slug", lambda tracks: "yolo26x__tracktrack__reid-none__imgsz640__buf3")
     monkeypatch.setattr(pipeline, "find_interactions", fake_find)
     return calls
 
 
-def test_a_windowed_run_writes_the_annotated_clip_and_both_records(
+def test_a_windowed_run_writes_the_two_files_and_nothing_else(
     tmp_path: Path, stubbed_stages: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The naming is the contract anyone reading the output depends on."""
@@ -248,20 +244,19 @@ def test_a_windowed_run_writes_the_annotated_clip_and_both_records(
 
     assert pipeline.main([str(clip), str(output)]) == 0
 
-    slug = "yolo26x__tracktrack__reid-none__imgsz640__buf3"
-    tag = "3.8-flash__fps2__low__think-medium__seed1__w8s4__a1__20260920-100000-000"
-    assert (output / "annotated" / f"clip__{slug}.mp4").is_file()
-    record = output / "interactions" / f"clip__{slug}" / f"{tag}.json"
-    merged = record.with_name(f"{tag}__merged.json")
-    assert json.loads(record.read_text())["clip_id"] == f"clip__{slug}"
-    assert json.loads(merged.read_text())["merged_interaction_count"] == 1
+    assert sorted(path.name for path in output.rglob("*")) == ["clip.json", "clip.mp4"]
+    written = json.loads((output / "clip.json").read_text())
+    assert written["merged_interaction_count"] == 1
+    # The source clip names the run, not the annotated file the model was shown.
+    assert written["clip_id"] == "clip"
     # The model reads the annotated render, never the source.
-    assert stubbed_stages["annotated"] == output / "annotated" / f"clip__{slug}.mp4"
+    assert stubbed_stages["annotated"] == output / "clip.mp4"
 
 
-def test_whole_clip_passes_no_windowing_and_writes_no_merged_file(
+def test_a_whole_clip_run_writes_the_same_two_files(
     tmp_path: Path, stubbed_stages: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The merged file is not conditional on windowing: one file shape, whichever way it ran."""
     monkeypatch.setattr(pipeline, "build_backend", lambda args: _StubBackend())
     clip = tmp_path / "clip.mp4"
     clip.touch()
@@ -270,7 +265,24 @@ def test_whole_clip_passes_no_windowing_and_writes_no_merged_file(
     assert pipeline.main([str(clip), str(output), "--whole-clip"]) == 0
 
     assert stubbed_stages["window"] == (None, None)
-    assert not list((output / "interactions").rglob("*__merged.json"))
+    assert sorted(path.name for path in output.rglob("*")) == ["clip.json", "clip.mp4"]
+    assert json.loads((output / "clip.json").read_text())["merged_interaction_count"] == 1
+
+
+def test_an_output_folder_that_would_swallow_the_clip_costs_nothing(
+    tmp_path: Path, stubbed_stages: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit 2 before the tracking pass, which is what refusing here rather than at the render buys."""
+    monkeypatch.setattr(pipeline, "build_backend", lambda args: _StubBackend())
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"source")
+
+    with pytest.raises(SystemExit) as exit_info:
+        pipeline.main([str(clip), str(tmp_path)])
+
+    assert exit_info.value.code == 2
+    assert "imgsz" not in stubbed_stages  # set by the tracking stub, so no stage ran
+    assert clip.read_bytes() == b"source"
 
 
 def test_one_clip_failing_costs_only_itself_and_the_exit_code(
@@ -292,8 +304,8 @@ def test_one_clip_failing_costs_only_itself_and_the_exit_code(
 
     assert pipeline.main([str(tmp_path), str(output)]) == 1
 
-    assert not list(output.glob("annotated/a__*.mp4"))
-    assert list(output.glob("annotated/b__*.mp4"))
+    assert not (output / "a.mp4").exists()
+    assert (output / "b.mp4").is_file()
     # The footage is on someone else's machine until this happens, and a raised stage is exactly
     # when it is easiest to skip.
     assert backend.deleted
@@ -347,7 +359,7 @@ def test_a_bad_argument_exits_before_any_clip_is_touched(tmp_path: Path) -> None
 def test_labels_the_clip_does_not_support_are_reported_on_stderr(
     tmp_path: Path, stubbed_stages: dict[str, Any], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A run whose ids were invented still succeeds; the warning is how anyone finds out."""
+    """A run whose ids were invented still succeeds; the warning is the only account of it."""
     monkeypatch.setattr(pipeline, "build_backend", lambda args: _StubBackend())
     stubbed_stages["times"] = {}  # the tracker drew nothing, so no reported label can hold up
     clip = tmp_path / "clip.mp4"
@@ -357,10 +369,9 @@ def test_labels_the_clip_does_not_support_are_reported_on_stderr(
     assert pipeline.main([str(clip), str(output)]) == 0
 
     assert "2 unsupported label(s) in 1 record(s): P1 x1, V1 x1" in capsys.readouterr().err
-    # Quarantined, not deleted: the record still says what the model claimed.
-    record = json.loads(next((output / "interactions").rglob("*[!d].json")).read_text())
-    assert record["interactions"][0]["person_ids"] == []
-    assert record["interactions"][0]["unverified_person_ids"] == ["P1"]
+    # The merged file has nowhere to put a quarantined label, so what survives is its absence.
+    merged = json.loads((output / "clip.json").read_text())
+    assert merged["interactions"][0]["person_ids"] == []
 
 
 def test_nothing_is_said_when_every_label_holds_up(

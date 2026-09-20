@@ -50,33 +50,38 @@ uv run human-vehicle Videos/gt1125_06.mp4 outputs/ --whole-clip
 uv run human-vehicle Videos/ outputs/ --vlm local --vlm-model mlx-community/Qwen3.5-9B-4bit
 ```
 
-A folder input is searched for `*.mp4`, not recursively. Anything already under the output folder is
-skipped, so pointing the output inside the input folder cannot feed a previous run's annotated clips
-back in — an annotated clip annotated a second time produces a run that looks perfectly normal and
-answers a different question.
+A folder input is searched for `*.mp4`, not recursively. The output folder must not be a clip's own
+folder: the annotated render is named after its source, so that would aim it at the input. It is
+refused before anything runs.
 
 ### What it writes
 
 ```
-outputs/annotated/<clip>__<tracking config>.mp4
-outputs/interactions/<clip>__<tracking config>/<run tag>.json
-outputs/interactions/<clip>__<tracking config>/<run tag>__merged.json
+outputs/<clip>.mp4     the annotated render
+outputs/<clip>.json    the merged interactions
 ```
 
-The names carry the configuration, so one output folder holds several runs side by side rather than
-overwriting: `<tracking config>` is `config_slug` of the record the run produced, and `<run tag>` is
-the model's configuration plus the moment the run started. The timestamp matters — two runs at
-identical settings genuinely differ, and comparing them is how a real difference is told from noise.
-Every path written is printed as it goes.
+Two files per clip, side by side, both named after the clip. Nothing else — no subfolders, and no
+per-window run record: the raw model text, the per-call usage and the per-call detail are used and
+then discarded. Both paths are printed as they are written.
 
-The merged file appears for a windowed run only, and is written after the record it derives from.
-It is regenerable; the record of what the model said is not. Check `failed_windows` and
-`malformed_count` in it before trusting it, as ever.
+The merged file is written for a whole-clip run too. `merge_interactions` runs on any run, and one
+call reporting each event once simply leaves it nothing to collapse, so `--whole-clip` produces the
+same one JSON. Check `failed_windows` and `malformed_count` in it before trusting it, as ever.
 
-This is the layout the notebooks use, so `notebooks/human_vehicle_interactions.ipynb` will read a
-folder this wrote. **Reach for the script to process clips and the notebooks to look at what came
-back** — the filmstrips, the uncovered sheet and the two-arm comparison are all there, and none of
-them are here.
+**The names carry no configuration, so a second run over a clip replaces the first.** Comparing two
+configurations, or repeating one to see how much a run varies, means pointing them at two output
+folders.
+
+Two files is what a clip that ran through produces. A clip whose model calls raise leaves its
+annotated mp4 and no JSON, and the summary at the end says which clip it was. Nothing in the output
+folder is cleaned up beforehand, so a folder reused across different inputs keeps what earlier runs
+left in it.
+
+**Reach for the script to process clips and the notebooks to look at what came back** — the
+filmstrips, the uncovered sheet and the two-arm comparison are all there, and none of them are here.
+The notebooks read their own folder, `notebooks/outputs/annotated/`, which you fill by copying in
+the annotated renders you want to look at.
 
 ### The parameters
 
@@ -122,11 +127,12 @@ look like it did something.
   does not support:
 
   ```
-  iMGR_0AG3a8_2_3__...: 4 unsupported label(s) in 3 record(s): P2 x1, P5 x2, P6 x1
+  iMGR_0AG3a8_2_3: 4 unsupported label(s) in 3 record(s): P2 x1, P5 x2, P6 x1
   ```
 
-  The run still succeeds and the records are still written — the labels are moved aside, not
-  dropped. A line like that says how much to trust that clip's id lists. See
+  The run still succeeds and the clip's JSON is still written; the unsupported labels are simply
+  not in its id lists. **That line is the only record of what was claimed** — the merged file has
+  no field for a quarantined label — so a run's warnings are worth keeping. See
   [A model does invent labels](#a-model-does-invent-labels).
 
 ## Detection and tracking
@@ -371,6 +377,11 @@ corroboration that never happened — which is exactly what `P5` did above. An e
 merges, by design, so moving the label is all it takes. On that clip the merge goes from six events
 to seven, and the one genuine two-window sighting is untouched.
 
+The `unverified_*` lists live on the run, and the pipeline writes only the merged file, which has
+no field for them. So what survives a script run is the label's *absence* from the merged id lists;
+what was claimed is said once, on stderr, as the clip is processed. A merged file with empty id
+lists and a quiet terminal is not the same thing as one whose terminal warned — read the warnings.
+
 `run.malformed` is left alone: those records failed validation and are kept exactly as they arrived.
 
 The check needs the tracking record the clip was rendered from, so it runs in the pipeline, where
@@ -578,6 +589,9 @@ paid for, and the merged file is derived.
 **It is derived, not a source of truth.** Regenerate it from the run beside it at any time, and check
 `failed_windows` and `malformed_count` before trusting it: a nonzero either way means the clip was
 never fully examined, however complete the merged list looks.
+
+The script is the other way round: it writes the merged file and keeps no run beside it, so there
+the merged file is all there is, and regenerating it means running the clip again.
 
 One false-merge mode is accepted rather than guarded. Because grouping is transitive, a single
 over-broad span can bridge two genuinely separate episodes for the same person and vehicle into one
