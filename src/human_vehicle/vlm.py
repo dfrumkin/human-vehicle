@@ -1,8 +1,10 @@
 """The vision-language model behind `human_vehicle.interactions`, and the seam it sits behind.
 
-Everything provider-specific lives here and nothing else does: the prompt, the response schema, the
-validation and the windowing are all in `interactions`, which knows a backend only through
-`VlmBackend`. Another model means another class here satisfying that protocol.
+`interactions` owns the question -- the prompt, the schema, the validation, the windowing -- and
+knows a backend only through `VlmBackend`. This module owns the model: its knobs, and whatever that
+particular model needs in order to answer in that schema. A backend whose runtime cannot constrain
+output has to put the shape into the prompt itself, which is why some prompt text is written here.
+Another model means another class here satisfying the protocol.
 
 There are two implementations. `GeminiBackend` is written against the `interactions.create` API and
 records the installed `google-genai` version in its `config`. `QwenBackend` runs Qwen3.5 locally,
@@ -20,7 +22,7 @@ import subprocess
 import tempfile
 import time
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -29,7 +31,7 @@ from typing import Any, Protocol
 from google import genai
 
 from human_vehicle.device import select_device
-from human_vehicle.tracking import require_binary
+from human_vehicle.video import probe_duration, require_binary
 
 # A window of the clip, in seconds on the clip's own clock: (start, end).
 Window = tuple[float, float]
@@ -116,9 +118,10 @@ class VlmBackend(Protocol):
         ...
 
 
-# Price per 1M tokens, gemini-3.8-flash paid tier, through 2026-12-31. Thinking bills as output.
-PRICE_IN_PER_MTOK = 0.75
-PRICE_OUT_PER_MTOK = 3.75
+# Price per 1M tokens, (input, output), paid tier, through 2026-12-31. Thinking bills as output.
+# Keyed by model, because a cost recorded at another model's rates is not an estimate but a wrong
+# number: `GeminiBackend` refuses an id that is not in here rather than write one.
+PRICES: Mapping[str, tuple[float, float]] = {"gemini-3.8-flash": (0.75, 3.75)}
 
 DEFAULT_MODEL_ID = "gemini-3.8-flash"
 
@@ -169,7 +172,14 @@ class GeminiBackend:
 
         `client` is for tests. Left None, a client is built from `GEMINI_API_KEY` on first use --
         lazily, so constructing a backend needs no credential and no network.
+
+        An unpriced `model_id` is refused here, before anything is spent: `usage` carries an
+        estimated cost into the run record, and a cost worked out at some other model's rates would
+        read as real. Adding a model means adding its rates to `PRICES`.
         """
+        if model_id not in PRICES:
+            raise ValueError(f"no price recorded for {model_id!r}; add its rates to vlm.PRICES")
+
         self.model_id = model_id
         self.fps = fps
         self.resolution = resolution
@@ -295,18 +305,18 @@ class GeminiBackend:
                 "seed": self.seed,
                 "max_output_tokens": self.max_output_tokens,
             },
+            # Inverts the API's default, which retains the prompt, the media reference and the
+            # output for 55 days. A regression here has no visible symptom, which is why a test
+            # asserts it on every request this backend sends.
             "store": False,
         }
-        # Asserted rather than passed hopefully: it inverts the API's default, and a regression
-        # would leave 55 days of retained logs with no visible symptom.
-        assert request["store"] is False, "store must be False: the API default retains 55 days of logs"
 
         interaction = self.client.interactions.create(**request)
-        return VlmResponse(text=interaction.output_text, usage=_usage(interaction))
+        return VlmResponse(text=interaction.output_text, usage=_usage(interaction, self.model_id))
 
 
-def _usage(interaction: Any) -> dict[str, float]:
-    """Token counts and an estimated price for one call.
+def _usage(interaction: Any, model_id: str) -> dict[str, float]:
+    """Token counts and an estimated price for one call, at `model_id`'s own rates.
 
     Thinking bills at the output rate but is reported *outside* `total_output_tokens`
     (total == input + output + thought), so billing `total_output_tokens` alone under-reports by
@@ -320,8 +330,9 @@ def _usage(interaction: Any) -> dict[str, float]:
         name: float(getattr(usage, name, 0) or 0)
         for name in ("total_input_tokens", "total_output_tokens", "total_thought_tokens", "total_tokens")
     }
+    price_in, price_out = PRICES[model_id]
     billable_out = counts["total_output_tokens"] + counts["total_thought_tokens"]
-    cost = counts["total_input_tokens"] / 1e6 * PRICE_IN_PER_MTOK + billable_out / 1e6 * PRICE_OUT_PER_MTOK
+    cost = counts["total_input_tokens"] / 1e6 * price_in + billable_out / 1e6 * price_out
     return {**counts, "billable_output_tokens": billable_out, "estimated_cost_usd": round(cost, 6)}
 
 
@@ -347,7 +358,9 @@ PIXELS_PER_FRAME = 640 * 480
 # tight enough that a keyframe-rounded cut cannot pass.
 TRIM_TOLERANCE_S = 0.2
 
-_TIME_FIELDS = ("start_time_s", "evidence_time_s", "end_time_s")
+# How `interactions.Interaction` names a time, and so how `time_fields` finds one in the schema.
+TIME_SUFFIX = "_time_s"
+
 _FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.IGNORECASE)
 
 
@@ -375,12 +388,15 @@ class LocalRuntime(Protocol):
         ...
 
     def generate(
-        self, video: Path, prompt: str, *, frames: int, max_new_tokens: int, seed: int
+        self, video: Path, prompt: str, *, frames: int | None, max_new_tokens: int, seed: int
     ) -> tuple[str, dict[str, float]]:
         """Answer `prompt` about `video`, returning the generated text and its token counts.
 
-        `frames` is how many the runtime is expected to sample, which the MLX path needs to size a
-        whole-video pixel budget. Only the generated tokens may be decoded into the text.
+        `frames` is how many the runtime is expected to sample, or None where the caller does not
+        know. A runtime that needs the count -- the MLX path, to size a whole-video pixel budget --
+        works it out from `video` itself when it is not given one, so the cost of finding out falls
+        only where the number is actually read. Only the generated tokens may be decoded into the
+        text.
         """
         ...
 
@@ -436,6 +452,25 @@ def _placeholder(spec: Mapping[str, Any]) -> Any:
     return _JSON_PLACEHOLDERS.get(str(kind), "...")
 
 
+def _item_fields(schema: Mapping[str, Any]) -> tuple[str, Mapping[str, Any]] | None:
+    """The name of the schema's list property and the properties of what it holds.
+
+    One walk -- array property, `$ref` into `$defs`, the item's `properties` -- shared by everything
+    that has to know the answer's shape, so no two of them can read it differently. None for a
+    schema this does not recognise; each caller decides what to do about that.
+    """
+    definitions = schema.get("$defs") or {}
+    properties = schema.get("properties") or {}
+    key = next((name for name, spec in properties.items() if spec.get("type") == "array"), None)
+    if key is None:
+        return None
+
+    reference = (properties[key].get("items") or {}).get("$ref", "")
+    item = definitions.get(reference.rsplit("/", 1)[-1]) or {}
+    fields = item.get("properties") or {}
+    return (key, fields) if fields else None
+
+
 def describe_schema(schema: Mapping[str, Any]) -> str:
     """Tell an unconstrained model the answer's shape, as fields and a worked example.
 
@@ -448,17 +483,10 @@ def describe_schema(schema: Mapping[str, Any]) -> str:
     actually validates. Falls back to the raw schema for a shape this does not recognise, which is
     worse but never wrong.
     """
-    definitions = schema.get("$defs") or {}
-    properties = schema.get("properties") or {}
-    key = next((name for name, spec in properties.items() if spec.get("type") == "array"), None)
-    if key is None:
+    walked = _item_fields(schema)
+    if walked is None:
         return f"Return JSON matching this schema:\n{json.dumps(schema)}"
-
-    reference = (properties[key].get("items") or {}).get("$ref", "")
-    item = definitions.get(reference.rsplit("/", 1)[-1]) or {}
-    fields = item.get("properties") or {}
-    if not fields:
-        return f"Return JSON matching this schema:\n{json.dumps(schema)}"
+    key, fields = walked
 
     lines = [
         f'Return a JSON object with one key, "{key}", holding a list of objects.',
@@ -483,7 +511,29 @@ def describe_schema(schema: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def shift_times(payload: Any, offset: float) -> Any:
+def time_fields(schema: Mapping[str, Any]) -> tuple[str, tuple[str, ...]]:
+    """Where the times are in an answer of this shape: the list's key, and the fields to move.
+
+    Read out of the schema rather than written down, so this cannot drift from what `interactions`
+    asks for and validates. Times are the numeric fields named `*_time_s`, which is the convention
+    `interactions.Interaction` follows; `confidence` is numeric too, and must not be shifted.
+
+    Raises where the schema has no such shape or no times in it, because the alternative -- shifting
+    nothing and saying nothing -- is a windowed run whose times are all wrong and whose record looks
+    healthy. Callers ask before they spend anything.
+    """
+    walked = _item_fields(schema)
+    if walked is None:
+        raise ValueError("schema has no list of objects to find times in")
+
+    key, fields = walked
+    found = tuple(name for name, spec in fields.items() if name.endswith(TIME_SUFFIX) and spec.get("type") == "number")
+    if not found:
+        raise ValueError(f"no {TIME_SUFFIX!r} fields in the schema's {key!r} items")
+    return key, found
+
+
+def shift_times(payload: Any, offset: float, *, key: str, fields: Sequence[str]) -> Any:
     """Return `payload` with every interaction's times moved onto the clip's clock.
 
     **This never raises, whatever shape it is handed.** `find_interactions` records `raw_text` and
@@ -499,7 +549,7 @@ def shift_times(payload: Any, offset: float) -> Any:
     """
     if not isinstance(payload, dict):
         return payload
-    items = payload.get("interactions")
+    items = payload.get(key)
     if not isinstance(items, list):
         return payload
 
@@ -509,12 +559,12 @@ def shift_times(payload: Any, offset: float) -> Any:
             shifted.append(item)
             continue
         moved: dict[str, Any] = dict(item)  # pyright: ignore[reportUnknownArgumentType]
-        for field in _TIME_FIELDS:
+        for field in fields:
             value = moved.get(field)
             if isinstance(value, int | float) and not isinstance(value, bool):
                 moved[field] = value + offset
         shifted.append(moved)
-    return {**payload, "interactions": shifted}
+    return {**payload, key: shifted}
 
 
 def trim_segment(source: Path, window: Window, destination: Path) -> Path:
@@ -565,10 +615,6 @@ def trim_segment(source: Path, window: Window, destination: Path) -> Path:
     )
     if completed.returncode != 0:
         raise RuntimeError(f"ffmpeg could not cut {window} from {source}: {completed.stderr.strip()}")
-
-    # Imported here rather than at module scope: `interactions` imports this module, so a top-level
-    # import would be a cycle. By call time both modules are loaded.
-    from human_vehicle.interactions import probe_duration
 
     actual = probe_duration(destination)
     if abs(actual - length) > TRIM_TOLERANCE_S:
@@ -630,14 +676,27 @@ class MlxRuntime:
             self._loaded = (model, processor, library.load_config(self.model_id))
         return self._loaded
 
+    @staticmethod
+    def _frames(video: Path) -> int:
+        """How many frames this runtime will sample from `video`.
+
+        Only reached when the caller did not know -- a whole-clip call -- and only on this path,
+        which is the one that needs the number.
+        """
+        return round(probe_duration(video) * LOCAL_FPS)
+
     def generate(
-        self, video: Path, prompt: str, *, frames: int, max_new_tokens: int, seed: int
+        self, video: Path, prompt: str, *, frames: int | None, max_new_tokens: int, seed: int
     ) -> tuple[str, dict[str, float]]:
         """One mlx-vlm call over `video`, decoded greedily.
 
         `max_pixels` is a budget for the whole video here, so the per-frame figure is multiplied by
-        the frame count; handing over the per-frame number directly would shrink every frame.
+        the frame count; handing over the per-frame number directly would shrink every frame. That
+        is why this path, and only this path, works the count out when it is not given one -- first,
+        before the weights are loaded, so a clip that cannot be probed fails in a second rather than
+        after several gigabytes have come off disk.
         """
+        sampled = max(1, frames if frames is not None else self._frames(video))
         library = self._library()
         model, processor, config = self._model()
         library.seed(seed)
@@ -648,7 +707,7 @@ class MlxRuntime:
             prompt,
             num_images=0,
             video=str(video),
-            max_pixels=PIXELS_PER_FRAME * max(1, frames),
+            max_pixels=PIXELS_PER_FRAME * sampled,
             fps=LOCAL_FPS,
             enable_thinking=False,
         )
@@ -751,14 +810,14 @@ class TorchRuntime:
         return self._loaded
 
     def generate(
-        self, video: Path, prompt: str, *, frames: int, max_new_tokens: int, seed: int
+        self, video: Path, prompt: str, *, frames: int | None, max_new_tokens: int, seed: int
     ) -> tuple[str, dict[str, float]]:
         """One transformers call over `video`, decoded greedily.
 
         `cap_pixels_per_frame=True` adopts the per-frame cap the reference implementation applies and
         transformers is making its default; without it a long video costs far more tokens than it
-        should. `frames` is unused on this path because the processor does its own sampling from the
-        metadata below.
+        should. `frames` is unused on this path -- the processor does its own sampling from the
+        metadata below -- so this path never asks what it would have been.
         """
         library = self._library()
         model, processor = self._model(library)
@@ -915,29 +974,30 @@ class QwenBackend:
         The schema goes into the prompt text, since nothing constrains a local model's output; the
         answer is then repaired into something `json.loads` accepts, and its times shifted onto the
         clip's clock.
+
+        Where there is a shift to apply, where the times live is worked out *first* -- before the
+        segment is cut and before the model is loaded. The schema does not depend on the video, so
+        one that hides its times costs nothing to reject, where finding out afterwards would mean an
+        answer that cannot be corrected and a call already spent.
         """
         asked = f"{prompt}\n\n{describe_schema(schema)}"
         offset = window[0] if window is not None else 0.0
+        located = time_fields(schema) if offset else None
 
         with tempfile.TemporaryDirectory() as directory:
             if window is None:
-                shown, seconds = video, None
+                # Whole clip: nobody here knows how many frames that is, and only a runtime that
+                # needs the count pays to find out.
+                shown, frames = video, None
             else:
                 shown = trim_segment(video, window, Path(directory) / "segment.mp4")
-                seconds = window[1] - window[0]
-            frames = round((seconds if seconds is not None else self._duration(video)) * LOCAL_FPS)
+                frames = max(1, round((window[1] - window[0]) * LOCAL_FPS))
             text, usage = self._runtime.generate(
-                shown, asked, frames=max(1, frames), max_new_tokens=self.max_new_tokens, seed=self.seed
+                shown, asked, frames=frames, max_new_tokens=self.max_new_tokens, seed=self.seed
             )
 
         repaired, payload = repair_json(text)
-        if payload is not None and offset:
-            repaired = json.dumps(shift_times(payload, offset))
+        if payload is not None and located is not None:
+            key, fields = located
+            repaired = json.dumps(shift_times(payload, offset, key=key, fields=fields))
         return VlmResponse(text=repaired, usage={**usage, "estimated_cost_usd": 0.0})
-
-    @staticmethod
-    def _duration(video: Path) -> float:
-        """The clip's length, for sizing a whole-clip call's pixel budget."""
-        from human_vehicle.interactions import probe_duration
-
-        return probe_duration(video)

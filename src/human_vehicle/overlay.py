@@ -17,7 +17,8 @@ import cv2
 from cv2.typing import MatLike
 
 from human_vehicle.labels import label_text
-from human_vehicle.tracking import Category, TrackedBox, VideoTracks, require_binary
+from human_vehicle.tracking import Category, TrackedBox, VideoTracks
+from human_vehicle.video import require_binary
 
 # Category is carried by color as well as by the label's letter. Azure and orange stay high-contrast
 # against typical street scenes and remain distinguishable under the common forms of color

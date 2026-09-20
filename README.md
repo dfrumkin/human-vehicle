@@ -291,7 +291,7 @@ and correcting the times here beats asking a 9B model to add an offset to everyt
 
 | Parameter | Default | What it is |
 | --- | --- | --- |
-| `model_id` | `"gemini-3.8-flash"` | the model to call |
+| `model_id` | `"gemini-3.8-flash"` | the model to call; it must have rates in `vlm.PRICES`, or the cost in the record would be another model's |
 | `fps` | `2.0` | how often the video is sampled; also the tolerance a windowed answer is allowed at a window's edge |
 | `resolution` | `"low"` | 70 tokens a frame; `"medium"` is identical for video, `"high"` is 280 |
 | `thinking_level` | `"medium"` | `low`, `medium` or `high`; thinking bills at the output rate |

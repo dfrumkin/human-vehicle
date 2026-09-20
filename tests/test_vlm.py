@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from human_vehicle.vlm import GeminiBackend, sum_usage
+from human_vehicle.vlm import PRICES, GeminiBackend, sum_usage
 
 SCHEMA: dict[str, Any] = {"type": "object", "properties": {"interactions": {"type": "array"}}}
 
@@ -187,6 +187,29 @@ def test_usage_bills_thinking_at_the_output_rate(clip: Path) -> None:
 
     assert response.usage["billable_output_tokens"] == 600.0
     assert response.usage["estimated_cost_usd"] == pytest.approx(1000 / 1e6 * 0.75 + 600 / 1e6 * 3.75)
+
+
+def test_the_cost_follows_the_model_that_ran(clip: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A second model, priced differently, must be billed differently.
+
+    With one model in `PRICES` a lookup and a hardcoded rate are indistinguishable, and a hardcoded
+    rate is what this is: a cost worked out at some other model's rates, written into the record as
+    though it were real.
+    """
+    monkeypatch.setattr("human_vehicle.vlm.PRICES", {**PRICES, "gemini-3.8-pro": (10.0, 100.0)})
+    client = _StubClient()
+
+    response = GeminiBackend(client=client, model_id="gemini-3.8-pro").generate(
+        clip, "a prompt", window=None, schema=SCHEMA
+    )
+
+    assert response.usage["estimated_cost_usd"] == pytest.approx(1000 / 1e6 * 10.0 + 600 / 1e6 * 100.0)
+
+
+def test_an_unpriced_model_is_refused_before_anything_is_spent() -> None:
+    """Construction fails, rather than a run finishing with a cost nobody can trust."""
+    with pytest.raises(ValueError, match="no price recorded"):
+        GeminiBackend(model_id="gemini-9.9-imaginary")
 
 
 def test_the_config_records_what_ran() -> None:

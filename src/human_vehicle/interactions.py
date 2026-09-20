@@ -28,7 +28,6 @@ Which model runs is `human_vehicle.vlm`'s business, not this module's.
 
 import json
 import re
-import subprocess
 import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -38,7 +37,8 @@ from typing import Any
 from pydantic import BaseModel, Field, ValidationError
 
 from human_vehicle.labels import CATEGORY_INITIALS
-from human_vehicle.tracking import Category, require_binary
+from human_vehicle.tracking import Category
+from human_vehicle.video import probe_duration
 from human_vehicle.vlm import VlmBackend, Window, sum_usage
 
 # Bumped whenever the prompt's wording changes, and written into every record: two runs are
@@ -56,7 +56,11 @@ _ID_FIELDS: Mapping[str, Category] = {"person_ids": Category.PERSON, "vehicle_id
 
 
 class Interaction(BaseModel):
-    """One person, one vehicle, one episode. This is the shape the model is asked for."""
+    """One person, one vehicle, one episode. This is the shape the model is asked for.
+
+    Times are named `*_time_s`: `vlm.time_fields` reads the suffix out of this schema to find what
+    to move when a backend answers about a segment, so renaming one is a decision, not a typo.
+    """
 
     person_ids: list[str] = Field(
         description="Every distinct label this person carried, in the order first seen, e.g. ['P1', 'P4']. "
@@ -172,35 +176,6 @@ def stated_duration(duration_s: float) -> float:
     answer as out of range. One value, used in both places.
     """
     return round(duration_s, 1)
-
-
-def probe_duration(video: Path) -> float:
-    """The clip's duration in seconds, from ffprobe."""
-    completed = subprocess.run(
-        [
-            require_binary("ffprobe"),
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "json",
-            str(video),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(f"ffprobe failed on {video}: {completed.stderr.strip()}")
-
-    duration = json.loads(completed.stdout).get("format", {}).get("duration")
-    if duration is None:
-        raise ValueError(f"{video} reports no duration")
-    seconds = float(duration)
-    if seconds <= 0:
-        raise ValueError(f"{video} reports a duration of {seconds}s")
-    return seconds
 
 
 def build_prompt(clip_id: str, duration_s: float, window: Window | None = None) -> str:

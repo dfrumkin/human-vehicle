@@ -1,16 +1,12 @@
 """Detection and tracking of people and vehicles in a video.
 
 `track_video` runs an Ultralytics detector and tracker over a clip and returns a compact record of
-the per-frame boxes and track ids. The record is small enough to keep in memory and to hand to
-`human_vehicle.overlay` for rendering.
+the per-frame boxes and track ids. The record is small enough to keep in memory and to pass around whole.
 
 The detector, tracker and ReID model are all chosen by plain strings. See `track_video`.
 """
 
-import json
 import re
-import shutil
-import subprocess
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -26,6 +22,7 @@ from ultralytics.utils import YAML
 from ultralytics.utils.checks import check_yaml
 
 from human_vehicle.device import select_device
+from human_vehicle.video import probe_stream
 
 
 class Category(StrEnum):
@@ -190,62 +187,14 @@ def _track_buffer_frames(buffer_seconds: float, fps: str) -> int:
     second at 30 fps and five at 6 fps. Occlusion is measured in seconds, so the duration is what
     the caller gives and the frame count is derived here.
 
-    `fps` is the exact rational ffprobe reports; `_probe` has already rejected the rates that would
-    make this zero.
+    `fps` is the exact rational ffprobe reports, which `Fraction` parses directly; `video.probe_stream`
+    has already rejected the degenerate rates, including the "0/0" that `Fraction` raises on rather
+    than parses. The floor, not that check, is what keeps a very low rate from yielding a useless
+    buffer.
     """
     if buffer_seconds <= 0:
         raise ValueError(f"buffer_seconds must be positive, not {buffer_seconds!r}")
     return max(MIN_TRACK_BUFFER, round(buffer_seconds * float(Fraction(fps))))
-
-
-def require_binary(name: str) -> str:
-    """Return the path to an external binary, or raise a clear error naming how to install it.
-
-    Lives here rather than in `overlay` because `track_video` needs ffprobe before any model work
-    starts, and `overlay` imports from this module anyway.
-    """
-    path = shutil.which(name)
-    if path is None:
-        raise RuntimeError(f"{name!r} is not on PATH; install it with 'brew install ffmpeg'")
-    return path
-
-
-def _probe(source: Path) -> tuple[int, int, str]:
-    """Return (width, height, fps) for a video's first video stream.
-
-    The frame rate is `avg_frame_rate` (frames over duration) rather than `r_frame_rate` (the base
-    rate needed to express every timestamp), because the render writes constant-frame-rate output
-    and `avg_frame_rate` is the rate that reproduces the source's duration.
-    """
-    completed = subprocess.run(
-        [
-            require_binary("ffprobe"),
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height,avg_frame_rate",
-            "-of",
-            "json",
-            str(source),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(f"ffprobe failed on {source}: {completed.stderr.strip()}")
-
-    streams = json.loads(completed.stdout).get("streams", [])
-    if not streams:
-        raise ValueError(f"{source} has no video stream")
-
-    stream = streams[0]
-    fps = str(stream["avg_frame_rate"])
-    if fps in {"0/0", "0/1"}:
-        raise ValueError(f"{source} reports no usable average frame rate ({fps!r})")
-    return int(stream["width"]), int(stream["height"]), fps
 
 
 def _check_class_names(names: Mapping[int, str]) -> None:
@@ -335,7 +284,7 @@ def track_video(
         raise FileNotFoundError(f"no such video: {source_path}")
 
     # Probed first: the buffer is a frame count derived from this clip's rate.
-    width, height, fps = _probe(source_path)
+    width, height, fps = probe_stream(source_path)
     track_buffer = _track_buffer_frames(buffer_seconds, fps)
 
     tracker_config = build_tracker_config(tracker, reid, track_buffer=track_buffer)

@@ -19,7 +19,8 @@ import cv2
 import numpy as np
 import pytest
 
-from human_vehicle.interactions import ClipInteractions, find_interactions, probe_duration
+from human_vehicle.interactions import ClipInteractions, find_interactions
+from human_vehicle.video import probe_duration
 from human_vehicle.vlm import (
     LOCAL_FPS,
     PIXELS_PER_FRAME,
@@ -29,11 +30,16 @@ from human_vehicle.vlm import (
     TorchRuntime,
     repair_json,
     shift_times,
+    time_fields,
     trim_segment,
 )
 from tests.conftest import MakeVideo
 
-SCHEMA: dict[str, Any] = {"type": "object", "properties": {"interactions": {"type": "array"}}}
+# The schema the model is actually asked for. A windowed call reads the times out of it, so a stub
+# shape here would exercise a schema nothing ever sends.
+SCHEMA: dict[str, Any] = ClipInteractions.model_json_schema()
+
+KEY, FIELDS = time_fields(SCHEMA)
 
 
 def _interaction(**overrides: Any) -> dict[str, Any]:
@@ -72,7 +78,7 @@ class _StubRuntime:
         return "stub-device"
 
     def generate(
-        self, video: Path, prompt: str, *, frames: int, max_new_tokens: int, seed: int
+        self, video: Path, prompt: str, *, frames: int | None, max_new_tokens: int, seed: int
     ) -> tuple[str, dict[str, float]]:
         if self._error is not None:
             raise self._error
@@ -159,15 +165,20 @@ def test_an_unrecognised_schema_falls_back_to_the_raw_schema(clip: Path) -> None
     assert json.loads(asked[asked.index("{") :]) == odd
 
 
-def test_frames_follow_the_segment_not_the_clip(clip: Path) -> None:
-    """The frame count sizes the MLX pixel budget, so it must describe what was actually sent."""
+def test_a_window_passes_its_frame_count_and_a_whole_clip_passes_none(clip: Path) -> None:
+    """The count sizes the MLX pixel budget, and only that path reads it.
+
+    A window's count is free -- the backend chose the window, so it knows the length. A whole clip's
+    costs a probe, so it is left to the runtime that actually needs it; the transformers path, which
+    ignores the argument, then never pays for it at all.
+    """
     runtime = _StubRuntime(json.dumps({"interactions": []}))
     backend = QwenBackend("Qwen/Qwen3.5-9B", runtime=runtime)
 
     backend.generate(clip, "prompt", window=None, schema=SCHEMA)
     backend.generate(clip, "prompt", window=(2.0, 6.0), schema=SCHEMA)
 
-    assert runtime.calls[0]["frames"] == round(probe_duration(clip) * LOCAL_FPS)
+    assert runtime.calls[0]["frames"] is None
     assert runtime.calls[1]["frames"] == round(4.0 * LOCAL_FPS)
 
 
@@ -239,10 +250,45 @@ def test_a_whole_clip_call_shifts_nothing(clip: Path) -> None:
     assert json.loads(response.text)["interactions"][0]["start_time_s"] == 1.0
 
 
+def test_the_times_to_move_are_read_out_of_the_schema() -> None:
+    """The anti-drift device: the fields are named here, and derived there.
+
+    A hardcoded list in `vlm` would go on shifting the fields it was written with. Renaming a time
+    on `Interaction` -- or adding one -- has to fail here rather than leave a windowed run quietly
+    reporting one uncorrected time among the corrected ones.
+
+    `confidence` is numeric too, and is the reason the suffix matters.
+    """
+    assert (KEY, set(FIELDS)) == ("interactions", {"start_time_s", "evidence_time_s", "end_time_s"})
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "object", "properties": {"whatever": {"type": "string"}}},
+        {"type": "object", "properties": {"interactions": {"type": "array", "items": {"$ref": "#/$defs/Gone"}}}},
+    ],
+)
+def test_a_schema_with_no_findable_times_fails_before_anything_is_spent(clip: Path, schema: Any) -> None:
+    """Shifting nothing and saying nothing would be a run of wrong times that looks healthy.
+
+    The window starts away from zero deliberately: one starting at 0.0 has no offset to apply and
+    skips the check by design, so the same test written that way would pass without testing
+    anything.
+    """
+    runtime = _StubRuntime(json.dumps({"interactions": []}))
+
+    with pytest.raises(ValueError, match=r"times|list of objects"):
+        QwenBackend("Qwen/Qwen3.5-9B", runtime=runtime).generate(clip, "p", window=(12.0, 18.0), schema=schema)
+
+    assert not runtime.calls, "the model must not have been asked, nor a segment cut, to find this out"
+
+
 def test_shifted_times_are_not_clamped() -> None:
     """A time past the segment stays past it; the validator decides, not the backend."""
     payload = {"interactions": [_interaction(end_time_s=6.4)]}
-    assert shift_times(payload, 12.0)["interactions"][0]["end_time_s"] == pytest.approx(18.4)
+    shifted = shift_times(payload, 12.0, key=KEY, fields=FIELDS)
+    assert shifted["interactions"][0]["end_time_s"] == pytest.approx(18.4)
 
 
 @pytest.mark.parametrize(
@@ -261,7 +307,7 @@ def test_the_shifter_never_raises(payload: Any) -> None:
     `find_interactions` records `raw_text` and `usage` only after `generate` returns, so a shifter
     that raised would turn the model's malformed output into a backend failure and lose both.
     """
-    shift_times(payload, 12.0)
+    shift_times(payload, 12.0, key=KEY, fields=FIELDS)
 
 
 def test_a_non_numeric_time_survives_to_the_validator(clip: Path) -> None:
@@ -519,6 +565,18 @@ def test_the_mlx_adapter_sizes_the_whole_video_pixel_budget(tmp_path: Path) -> N
     assert template.kwargs["fps"] == LOCAL_FPS
 
 
+def test_the_mlx_adapter_works_the_frame_count_out_when_it_is_not_given_one(clip: Path) -> None:
+    """A whole-clip call cannot know the count, and this is the path that needs it.
+
+    Treating a missing count as one frame would size a twenty-second clip's whole-video budget at a
+    single frame's worth of pixels.
+    """
+    runtime, template, _, _ = _mlx_runtime()
+    runtime.generate(clip, "prompt", frames=None, max_new_tokens=512, seed=1)
+
+    assert template.kwargs["max_pixels"] == PIXELS_PER_FRAME * round(probe_duration(clip) * LOCAL_FPS)
+
+
 def test_the_mlx_adapter_sends_the_video(tmp_path: Path) -> None:
     """The model is shown video, not stills -- on both the template and the generate call."""
     runtime, template, generate, _ = _mlx_runtime()
@@ -634,9 +692,12 @@ def test_the_torch_adapter_decodes_video_itself_with_opencv(tmp_path: Path) -> N
     What reaches the processor is still a video -- decoded frames with their temporal patching
     intact -- and the metadata must describe *that* array, not the source, or the processor samples
     again from the wrong rate and indexes past the end.
+
+    No frame count is passed, and the file does not exist: this path samples from what it decoded,
+    so it must neither read the argument nor go looking for a duration of its own.
     """
     runtime, processor, load_video, metadata = _torch_runtime()
-    runtime.generate(tmp_path / "seg.mp4", "prompt", frames=12, max_new_tokens=512, seed=1)
+    runtime.generate(tmp_path / "seg.mp4", "prompt", frames=None, max_new_tokens=512, seed=1)
 
     assert load_video.kwargs["backend"] == "opencv"
     assert load_video.kwargs["fps"] == LOCAL_FPS
