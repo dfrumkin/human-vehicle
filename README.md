@@ -164,8 +164,8 @@ Notes:
 - Weights and ReID models download on first use, so the first run needs a network.
 - The ReID models are ONNX, and run through the ONNX runtime the project declares. `reid="auto"`
   needs neither the download nor the runtime, since it reuses the detector's own features.
-- `device` defaults to `"mps"`. Ultralytics' automatic device selection falls through to the CPU
-  on macOS unless MPS is asked for by name, so leave it alone unless you want the CPU.
+- The device is detected, not asked for: CUDA if there is one, else MPS, else the CPU. Ultralytics
+  has its own automatic selection, but it falls through to the CPU on macOS unless MPS is named.
 - `imgsz` defaults to 640. Raise it to 960 or 1280 on 4K footage, where 640 misses small, distant
   people.
 - Ultralytics is AGPL-3.0.

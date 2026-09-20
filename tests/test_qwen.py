@@ -11,6 +11,7 @@ answer rather than an error, so a test is the only thing that would notice.
 
 import json
 import subprocess
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -558,7 +559,9 @@ class _FakeProcessor:
         return '{"interactions": []}'
 
 
-def _torch_runtime(prompt_length: int = 100, total_length: int = 130) -> tuple[TorchRuntime, Any, Any, Any]:
+def _torch_runtime(
+    prompt_length: int = 100, total_length: int = 130, *, cuda: bool = True, mps: bool = False
+) -> tuple[TorchRuntime, Any, Any, Any]:
     from human_vehicle.vlm import TorchEntryPoints
 
     processor = _FakeProcessor(prompt_length)
@@ -571,10 +574,19 @@ def _torch_runtime(prompt_length: int = 100, total_length: int = 130) -> tuple[T
     class _FakeCuda:
         @staticmethod
         def is_available() -> bool:
-            return True
+            return cuda
+
+    class _FakeMps:
+        @staticmethod
+        def is_available() -> bool:
+            return mps
+
+    class _FakeBackends:
+        mps = _FakeMps()
 
     class _FakeTorch:
         cuda = _FakeCuda()
+        backends = _FakeBackends()
         bfloat16 = "bfloat16"
         manual_seed = _Recorder()
         use_deterministic_algorithms = _Recorder()
@@ -637,3 +649,17 @@ def test_the_torch_adapter_decodes_video_itself_with_opencv(tmp_path: Path) -> N
 
     content = processor.template.args[0][0]["content"]
     assert [item["type"] for item in content] == ["video", "text"]
+
+
+def test_the_torch_adapter_complains_only_when_it_lands_on_the_cpu(tmp_path: Path) -> None:
+    """A CPU call takes minutes, which looks hung; an accelerated one is unremarkable."""
+    runtime, _, _, _ = _torch_runtime(cuda=False, mps=False)
+    with pytest.warns(RuntimeWarning, match="no GPU found"):
+        runtime.generate(tmp_path / "seg.mp4", "prompt", frames=12, max_new_tokens=512, seed=1)
+    assert runtime.device == "cpu"
+
+    accelerated, _, _, _ = _torch_runtime(cuda=False, mps=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        accelerated.generate(tmp_path / "seg.mp4", "prompt", frames=12, max_new_tokens=512, seed=1)
+    assert accelerated.device == "mps"

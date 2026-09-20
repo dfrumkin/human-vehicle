@@ -128,14 +128,18 @@ def test_track_video_asks_the_tracker_for_the_mapped_classes(
 ) -> None:
     """The class filter must stay in step with the category table, and results must stream."""
     monkeypatch.setattr(tracking, "YOLO", _StubYOLO)
+    # Patched so the assertion below is about this machine's answer reaching the tracker, not about
+    # which device the machine running the suite happens to have.
+    monkeypatch.setattr(tracking, "select_device", lambda: "detected-device")
 
     track_video(make_video(frames=3))
 
     assert _StubYOLO.last_kwargs["classes"] == sorted(COCO_CLASSES)
     # stream=True keeps one decoded frame alive at a time; without it a 4K clip retains gigabytes.
     assert _StubYOLO.last_kwargs["stream"] is True
-    # Ultralytics falls through to the CPU on macOS unless MPS is named explicitly.
-    assert _StubYOLO.last_kwargs["device"] == "mps"
+    # Detected, not defaulted: Ultralytics' own selection falls through to the CPU on macOS unless
+    # MPS is named explicitly.
+    assert _StubYOLO.last_kwargs["device"] == "detected-device"
     # persist carries tracker state between calls, which would leak ids from a previous clip.
     assert "persist" not in _StubYOLO.last_kwargs
     # conf is deliberately not passed: Ultralytics applies 0.1 in track mode itself, and passing it

@@ -25,6 +25,8 @@ from ultralytics.trackers.track import TRACKER_MAP
 from ultralytics.utils import YAML
 from ultralytics.utils.checks import check_yaml
 
+from human_vehicle.device import select_device
+
 
 class Category(StrEnum):
     """The two kinds of thing this project cares about."""
@@ -298,7 +300,6 @@ def track_video(
     reid: str = "none",
     imgsz: int = 640,
     buffer_seconds: float = 3.0,
-    device: str = "mps",
 ) -> VideoTracks:
     """Detect and track people and vehicles through a clip.
 
@@ -313,9 +314,10 @@ def track_video(
       model such as "yolo26s-reid.onnx". Only BoT-SORT, TrackTrack and Deep OC-SORT have a ReID
       stage; asking the others for one raises rather than being ignored.
 
-    `device` defaults to "mps" because Ultralytics' automatic device selection falls through to the
-    CPU on macOS unless MPS is asked for by name. `imgsz` is worth raising to 960 or 1280 on 4K
-    footage, where 640 misses small, distant people.
+    The device is detected rather than chosen: `select_device` prefers CUDA, then MPS, then the
+    CPU. Ultralytics has its own automatic selection, but it falls through to the CPU on macOS
+    unless MPS is asked for by name. `imgsz` is worth raising to 960 or 1280 on 4K footage, where
+    640 misses small, distant people.
 
     `buffer_seconds` is how long a lost track stays re-findable before its id is retired, which is
     what decides whether an id survives an occlusion. It is given in seconds because that is what
@@ -347,7 +349,7 @@ def track_video(
     with tempfile.TemporaryDirectory() as directory:
         tracker_path = Path(directory) / "tracker.yaml"
         YAML.save(str(tracker_path), tracker_config)
-        frames = _tracked_frames(model, source_path, tracker_path, imgsz=imgsz, device=device)
+        frames = _tracked_frames(model, source_path, tracker_path, imgsz=imgsz, device=select_device())
 
     return VideoTracks(
         source=source_path,

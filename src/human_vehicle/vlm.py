@@ -28,6 +28,7 @@ from typing import Any, Protocol
 
 from google import genai
 
+from human_vehicle.device import select_device
 from human_vehicle.tracking import require_binary
 
 # A window of the clip, in seconds on the clip's own clock: (start, end).
@@ -728,15 +729,19 @@ class TorchRuntime:
         return self._entry_points
 
     def _select_device(self, library: Any) -> str:
-        """CUDA where there is one, CPU otherwise -- loudly, since CPU is slow enough to look hung."""
-        if library.torch.cuda.is_available():
-            return "cuda"
-        warnings.warn(
-            f"no CUDA device found; running {self.model_id} on the CPU, which takes minutes per call",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return "cpu"
+        """Whatever accelerator this machine has, and loudly when it has none.
+
+        The fallback order is `select_device`'s; only the complaint is this runtime's, because the
+        CPU is slow enough here to look hung.
+        """
+        device = select_device(library.torch)
+        if device == "cpu":
+            warnings.warn(
+                f"no GPU found; running {self.model_id} on the CPU, which takes minutes per call",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return device
 
     def _model(self, library: Any) -> Any:
         if self._loaded is None:
